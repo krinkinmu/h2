@@ -10,6 +10,7 @@ use bytes::buf::Take;
 use std::{
     cmp::{self, Ordering},
     fmt, io, mem,
+    sync::Mutex,
     task::{Context, Poll, Waker},
 };
 
@@ -114,7 +115,7 @@ impl Prioritize {
         frame: Frame<B>,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) {
         let span = tracing::trace_span!("Prioritize::queue_frame", ?stream.id);
         let _e = span.enter();
@@ -123,7 +124,7 @@ impl Prioritize {
         self.schedule_send(stream, task);
     }
 
-    pub fn schedule_send(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+    pub fn schedule_send(&mut self, stream: &mut store::Ptr, task: &Mutex<Option<Waker>>) {
         // If the stream is waiting to be opened, nothing more to do.
         if stream.is_send_ready() {
             tracing::trace!(?stream.id, "schedule_send");
@@ -131,7 +132,7 @@ impl Prioritize {
             self.pending_send.push(stream);
 
             // Notify the connection.
-            if let Some(task) = task.take() {
+            if let Some(task) = task.lock().unwrap().take() {
                 task.wake();
             }
         }
@@ -148,7 +149,7 @@ impl Prioritize {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError>
     where
         B: Buf,

@@ -89,7 +89,7 @@ struct Actions {
     send: Send,
 
     /// Task that calls `poll_complete`.
-    task: Option<Waker>,
+    task: Mutex<Option<Waker>>,
 
     /// If the connection errors, a copy is kept for any StreamRefs.
     conn_error: Option<proto::Error>,
@@ -124,7 +124,7 @@ where
 
         me.actions
             .recv
-            .set_target_connection_window(size, &mut me.actions.task)
+            .set_target_connection_window(size, &me.actions.task)
     }
 
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
@@ -204,7 +204,7 @@ where
             send_buffer,
             &mut me.store,
             &mut me.counts,
-            &mut me.actions.task,
+            &me.actions.task,
         )
     }
 
@@ -283,7 +283,7 @@ where
             send_buffer,
             &mut stream,
             &mut me.counts,
-            &mut me.actions.task,
+            &me.actions.task,
         );
 
         // send_headers can return a UserError, if it does,
@@ -406,7 +406,7 @@ impl Inner {
             actions: Actions {
                 recv: Recv::new(peer, &config),
                 send: Send::new(&config),
-                task: None,
+                task: Mutex::new(None),
                 conn_error: None,
             },
             store: Store::new(),
@@ -499,14 +499,14 @@ impl Inner {
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
                         if let Some(resp) = resp {
                             let sent = actions.send.send_headers(
-                                resp, send_buffer, stream, counts, &mut actions.task);
+                                resp, send_buffer, stream, counts, &actions.task);
                             debug_assert!(sent.is_ok(), "oversize response should not fail");
 
                             actions.send.schedule_implicit_reset(
                                 stream,
                                 Reason::PROTOCOL_ERROR,
                                 counts,
-                                &mut actions.task);
+                                &actions.task);
 
                             actions.recv.enqueue_reset_expiration(stream, counts);
 
@@ -586,7 +586,7 @@ impl Inner {
             if let Err(Error::Reset(..)) = res {
                 actions
                     .recv
-                    .release_connection_capacity(sz as WindowSize, &mut None);
+                    .release_connection_capacity(sz as WindowSize, &Mutex::new(None));
             }
             actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
         })
@@ -667,7 +667,7 @@ impl Inner {
                     send_buffer,
                     &mut stream,
                     &mut self.counts,
-                    &mut self.actions.task,
+                    &self.actions.task,
                 );
             } else {
                 self.actions
@@ -899,7 +899,7 @@ impl Inner {
         ))?;
 
         // Nothing else to do, track the task
-        self.actions.task = Some(cx.waker().clone());
+        let _ = self.actions.task.lock().unwrap().insert(cx.waker().clone());
 
         Poll::Ready(Ok(()))
     }
@@ -1054,7 +1054,7 @@ where
         if let Ok(mut inner) = self.inner.lock() {
             inner.refs -= 1;
             if inner.refs == 1 {
-                if let Some(task) = inner.actions.task.take() {
+                if let Some(task) = inner.actions.task.lock().unwrap().take() {
                     task.wake();
                 }
             }
@@ -1085,7 +1085,7 @@ impl<B> StreamRef<B> {
             // Send the data frame
             actions
                 .send
-                .send_data(frame, send_buffer, stream, counts, &mut actions.task)
+                .send_data(frame, send_buffer, stream, counts, &actions.task)
         })
     }
 
@@ -1105,7 +1105,7 @@ impl<B> StreamRef<B> {
             // Send the trailers frame
             actions
                 .send
-                .send_trailers(frame, send_buffer, stream, counts, &mut actions.task)
+                .send_trailers(frame, send_buffer, stream, counts, &actions.task)
         })
     }
 
@@ -1141,7 +1141,7 @@ impl<B> StreamRef<B> {
 
             actions
                 .send
-                .send_headers(frame, send_buffer, stream, counts, &mut actions.task)
+                .send_headers(frame, send_buffer, stream, counts, &actions.task)
         })
     }
 
@@ -1181,7 +1181,7 @@ impl<B> StreamRef<B> {
 
             actions
                 .send
-                .send_push_promise(frame, send_buffer, &mut stream, &mut actions.task)
+                .send_push_promise(frame, send_buffer, &mut stream, &actions.task)
         };
 
         if let Err(err) = pushed {
@@ -1378,7 +1378,7 @@ impl OpaqueStreamRef {
 
         me.actions
             .recv
-            .release_capacity(capacity, &mut stream, &mut me.actions.task)
+            .release_capacity(capacity, &mut stream, &me.actions.task)
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.
@@ -1470,7 +1470,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     // of canceling the stream), we should notify the task
     // (connection) so that it can close properly
     if stream.ref_count == 0 && stream.is_closed() {
-        if let Some(task) = actions.task.take() {
+        if let Some(task) = actions.task.lock().unwrap().take() {
             task.wake();
         }
     }
@@ -1483,7 +1483,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &mut actions.task);
+                .release_closed_capacity(stream, &actions.task);
 
             // We won't be able to reach our push promises anymore
             let mut ppp = stream.pending_push_promises.take();
@@ -1512,7 +1512,7 @@ fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Cou
 
         actions
             .send
-            .schedule_implicit_reset(stream, reason, counts, &mut actions.task);
+            .schedule_implicit_reset(stream, reason, counts, &actions.task);
         actions.recv.enqueue_reset_expiration(stream, counts);
     }
 }
@@ -1549,7 +1549,7 @@ impl Actions {
                 send_buffer,
                 stream,
                 counts,
-                &mut self.task,
+                &self.task,
             );
             self.recv.enqueue_reset_expiration(stream, counts);
             // if a RecvStream is parked, ensure it's notified
@@ -1572,7 +1572,7 @@ impl Actions {
 
                 // Reset the stream.
                 self.send
-                    .send_reset(reason, initiator, buffer, stream, counts, &mut self.task);
+                    .send_reset(reason, initiator, buffer, stream, counts, &self.task);
                 self.recv.enqueue_reset_expiration(stream, counts);
                 // if a RecvStream is parked, ensure it's notified
                 stream.notify_recv();

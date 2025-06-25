@@ -11,6 +11,7 @@ use tokio::io::AsyncWrite;
 
 use std::cmp::Ordering;
 use std::io;
+use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 
 /// Manages state transitions related to outbound frames.
@@ -101,7 +102,7 @@ impl Send {
         frame: frame::PushPromise,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         if !self.is_push_enabled {
             return Err(UserError::PeerDisabledServerPush);
@@ -128,7 +129,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         tracing::trace!(
             "send_headers; frame={:?}; init_window={:?}",
@@ -159,7 +160,7 @@ impl Send {
         // Need to notify the connection when pushing onto pending_open since
         // queue_frame only notifies for pending_send.
         if pending_open {
-            if let Some(task) = task.take() {
+            if let Some(task) = task.lock().unwrap().take() {
                 task.wake();
             }
         }
@@ -175,7 +176,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) {
         let is_reset = stream.state.is_reset();
         let is_closed = stream.state.is_closed();
@@ -238,7 +239,7 @@ impl Send {
         stream: &mut store::Ptr,
         reason: Reason,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) {
         if stream.state.is_closed() {
             // Stream is already closed, nothing more to do
@@ -257,7 +258,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError>
     where
         B: Buf,
@@ -272,7 +273,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         // TODO: Should this logic be moved into state.rs?
         if !stream.state.is_send_streaming() {
@@ -372,7 +373,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), Reason> {
         if let Err(e) = self.prioritize.recv_stream_window_update(sz, stream) {
             tracing::debug!("recv_stream_window_update !!; err={:?}", e);
@@ -429,7 +430,7 @@ impl Send {
         buffer: &mut Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), Error> {
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
             self.is_extended_connect_protocol_enabled = val;

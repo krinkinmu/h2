@@ -7,6 +7,7 @@ use http::{HeaderMap, Request, Response};
 
 use std::cmp::Ordering;
 use std::io;
+use std::sync::Mutex;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -370,7 +371,7 @@ impl Recv {
     }
 
     /// Releases capacity of the connection
-    pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &mut Option<Waker>) {
+    pub fn release_connection_capacity(&mut self, capacity: WindowSize, task: &Mutex<Option<Waker>>) {
         tracing::trace!(
             "release_connection_capacity; size={}, connection in_flight_data={}",
             capacity,
@@ -386,7 +387,7 @@ impl Recv {
         debug_assert!(_res.is_ok());
 
         if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
+            if let Some(task) = task.lock().unwrap().take() {
                 task.wake();
             }
         }
@@ -397,7 +398,7 @@ impl Recv {
         &mut self,
         capacity: WindowSize,
         stream: &mut store::Ptr,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         tracing::trace!("release_capacity; size={}", capacity);
 
@@ -419,7 +420,7 @@ impl Recv {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
-            if let Some(task) = task.take() {
+            if let Some(task) = task.lock().unwrap().take() {
                 task.wake();
             }
         }
@@ -428,7 +429,7 @@ impl Recv {
     }
 
     /// Release any unclaimed capacity for a closed stream.
-    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &mut Option<Waker>) {
+    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &Mutex<Option<Waker>>) {
         debug_assert_eq!(stream.ref_count, 0);
 
         if stream.in_flight_recv_data == 0 {
@@ -462,7 +463,7 @@ impl Recv {
     pub fn set_target_connection_window(
         &mut self,
         target: WindowSize,
-        task: &mut Option<Waker>,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), Reason> {
         tracing::trace!(
             "set_target_connection_window; target={}; available={}, reserved={}",
@@ -491,7 +492,7 @@ impl Recv {
         // enough that we went over the update threshold, then schedule sending
         // a connection WINDOW_UPDATE.
         if self.flow.unclaimed_capacity().is_some() {
-            if let Some(task) = task.take() {
+            if let Some(task) = task.lock().unwrap().take() {
                 task.wake();
             }
         }
@@ -659,7 +660,7 @@ impl Recv {
                 "recv_data; frame ignored on stream release {:?} for some time",
                 stream.id,
             );
-            self.release_connection_capacity(sz, &mut None);
+            self.release_connection_capacity(sz, &Mutex::new(None));
             return Ok(());
         }
 
@@ -693,7 +694,7 @@ impl Recv {
         // This call doesn't send a WINDOW_UPDATE immediately, just marks
         // the capacity as available to be reclaimed. When the available
         // capacity meets a threshold, a WINDOW_UPDATE is then sent.
-        self.release_connection_capacity(sz, &mut None);
+        self.release_connection_capacity(sz, &Mutex::new(None));
         Ok(())
     }
 
