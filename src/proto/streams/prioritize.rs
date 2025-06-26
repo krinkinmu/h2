@@ -113,7 +113,7 @@ impl Prioritize {
     pub fn queue_frame<B>(
         &mut self,
         frame: Frame<B>,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         task: &Mutex<Option<Waker>>,
     ) {
@@ -146,7 +146,7 @@ impl Prioritize {
     pub fn send_data<B>(
         &mut self,
         frame: frame::Data<B>,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -513,7 +513,7 @@ impl Prioritize {
     pub fn poll_complete<T, B>(
         &mut self,
         cx: &mut Context,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
@@ -580,7 +580,7 @@ impl Prioritize {
     /// In this case, the stream needs to be reprioritized.
     fn reclaim_frame<T, B>(
         &mut self,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> bool
@@ -600,7 +600,7 @@ impl Prioritize {
 
     fn reclaim_frame_inner<B>(
         &mut self,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         frame: frame::Data<Prioritized<B>>,
     ) -> bool
@@ -653,7 +653,7 @@ impl Prioritize {
     fn push_back_frame<B>(
         &mut self,
         frame: Frame<B>,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
     ) {
         // Push the frame to the front of the stream's deque
@@ -666,7 +666,7 @@ impl Prioritize {
         }
     }
 
-    pub fn clear_queue<B>(&mut self, buffer: &mut Buffer<Frame<B>>, stream: &mut store::Ptr) {
+    pub fn clear_queue<B>(&mut self, buffer: &Buffer<Frame<B>>, stream: &mut store::Ptr) {
         let span = tracing::trace_span!("clear_queue", ?stream.id);
         let _e = span.enter();
 
@@ -704,7 +704,7 @@ impl Prioritize {
 
     fn pop_frame<B>(
         &mut self,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         max_len: usize,
         counts: &mut Counts,

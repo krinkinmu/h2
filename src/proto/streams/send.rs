@@ -100,7 +100,7 @@ impl Send {
     pub fn send_push_promise<B>(
         &mut self,
         frame: frame::PushPromise,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
@@ -126,7 +126,7 @@ impl Send {
     pub fn send_headers<B>(
         &mut self,
         frame: frame::Headers,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -173,7 +173,7 @@ impl Send {
         &mut self,
         reason: Reason,
         initiator: Initiator,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -255,7 +255,7 @@ impl Send {
     pub fn send_data<B>(
         &mut self,
         frame: frame::Data<B>,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -270,7 +270,7 @@ impl Send {
     pub fn send_trailers<B>(
         &mut self,
         frame: frame::Headers,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -295,7 +295,7 @@ impl Send {
     pub fn poll_complete<T, B>(
         &mut self,
         cx: &mut Context,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
@@ -370,7 +370,7 @@ impl Send {
     pub fn recv_stream_window_update<B>(
         &mut self,
         sz: WindowSize,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
@@ -415,7 +415,7 @@ impl Send {
 
     pub fn handle_error<B>(
         &mut self,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         stream: &mut store::Ptr,
         counts: &mut Counts,
     ) {
@@ -427,7 +427,7 @@ impl Send {
     pub fn apply_remote_settings<B>(
         &mut self,
         settings: &frame::Settings,
-        buffer: &mut Buffer<Frame<B>>,
+        buffer: &Buffer<Frame<B>>,
         store: &mut Store,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
