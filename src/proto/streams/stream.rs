@@ -32,9 +32,6 @@ pub(super) struct Stream {
     pub ref_count: usize,
 
     // ===== Fields related to sending =====
-    /// Next node in the accept linked list
-    pub next_pending_send: Option<store::Key>,
-
     /// Set to true when the stream is pending accept
     pub is_pending_send: bool,
 
@@ -54,18 +51,11 @@ pub(super) struct Stream {
     /// Frames pending for this stream being sent to the socket
     pub pending_send: buffer::Deque,
 
-    /// Next node in the linked list of streams waiting for additional
-    /// connection level capacity.
-    pub next_pending_send_capacity: Option<store::Key>,
-
     /// True if the stream is waiting for outbound connection capacity
     pub is_pending_send_capacity: bool,
 
     /// Set to true when the send capacity has been incremented
     pub send_capacity_inc: bool,
-
-    /// Next node in the open linked list
-    pub next_open: Option<store::Key>,
 
     /// Set to true when the stream is pending to be opened
     pub is_pending_open: bool,
@@ -74,9 +64,6 @@ pub(super) struct Stream {
     pub is_pending_push: bool,
 
     // ===== Fields related to receiving =====
-    /// Next node in the accept linked list
-    pub next_pending_accept: Option<store::Key>,
-
     /// Set to true when the stream is pending accept
     pub is_pending_accept: bool,
 
@@ -85,17 +72,11 @@ pub(super) struct Stream {
 
     pub in_flight_recv_data: WindowSize,
 
-    /// Next node in the linked list of streams waiting to send window updates.
-    pub next_window_update: Option<store::Key>,
-
     /// True if the stream is waiting to send a window update
     pub is_pending_window_update: bool,
 
     /// The time when this stream may have been locally reset.
     pub reset_at: Option<Instant>,
-
-    /// Next node in list of reset streams that should expire eventually
-    pub next_reset_expire: Option<store::Key>,
 
     /// Frames pending for this stream to read
     pub pending_recv: buffer::Deque,
@@ -165,7 +146,6 @@ impl Stream {
             is_counted: false,
 
             // ===== Fields related to sending =====
-            next_pending_send: None,
             is_pending_send: false,
             send_flow,
             requested_send_capacity: 0,
@@ -173,21 +153,16 @@ impl Stream {
             send_task: None,
             pending_send: buffer::Deque::new(),
             is_pending_send_capacity: false,
-            next_pending_send_capacity: None,
             send_capacity_inc: false,
             is_pending_open: false,
-            next_open: None,
             is_pending_push: false,
 
             // ===== Fields related to receiving =====
-            next_pending_accept: None,
             is_pending_accept: false,
             recv_flow,
             in_flight_recv_data: 0,
-            next_window_update: None,
             is_pending_window_update: false,
             reset_at: None,
-            next_reset_expire: None,
             pending_recv: buffer::Deque::new(),
             is_recv: true,
             recv_task: None,
@@ -398,30 +373,21 @@ impl fmt::Debug for Stream {
             .field("state", &self.state)
             .field("is_counted", &self.is_counted)
             .field("ref_count", &self.ref_count)
-            .field("next_pending_send", &self.next_pending_send)
             .field("is_pending_send", &self.is_pending_send)
             .field("send_flow", &self.send_flow)
             .field("requested_send_capacity", &self.requested_send_capacity)
             .field("buffered_send_data", &self.buffered_send_data)
             .field("send_task", &self.send_task.as_ref().map(|_| ()))
             .field("pending_send", &self.pending_send)
-            .field(
-                "next_pending_send_capacity",
-                &self.next_pending_send_capacity,
-            )
             .field("is_pending_send_capacity", &self.is_pending_send_capacity)
             .field("send_capacity_inc", &self.send_capacity_inc)
-            .field("next_open", &self.next_open)
             .field("is_pending_open", &self.is_pending_open)
             .field("is_pending_push", &self.is_pending_push)
-            .field("next_pending_accept", &self.next_pending_accept)
             .field("is_pending_accept", &self.is_pending_accept)
             .field("recv_flow", &self.recv_flow)
             .field("in_flight_recv_data", &self.in_flight_recv_data)
-            .field("next_window_update", &self.next_window_update)
             .field("is_pending_window_update", &self.is_pending_window_update)
             .field("reset_at", &self.reset_at)
-            .field("next_reset_expire", &self.next_reset_expire)
             .field("pending_recv", &self.pending_recv)
             .field("is_recv", &self.is_recv)
             .field("recv_task", &self.recv_task.as_ref().map(|_| ()))
@@ -433,18 +399,6 @@ impl fmt::Debug for Stream {
 }
 
 impl store::Next for NextAccept {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_pending_accept
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_pending_accept = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_pending_accept.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.is_pending_accept
     }
@@ -455,18 +409,6 @@ impl store::Next for NextAccept {
 }
 
 impl store::Next for NextSend {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_pending_send
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_pending_send = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_pending_send.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.is_pending_send
     }
@@ -482,18 +424,6 @@ impl store::Next for NextSend {
 }
 
 impl store::Next for NextSendCapacity {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_pending_send_capacity
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_pending_send_capacity = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_pending_send_capacity.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.is_pending_send_capacity
     }
@@ -504,18 +434,6 @@ impl store::Next for NextSendCapacity {
 }
 
 impl store::Next for NextWindowUpdate {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_window_update
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_window_update = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_window_update.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.is_pending_window_update
     }
@@ -526,18 +444,6 @@ impl store::Next for NextWindowUpdate {
 }
 
 impl store::Next for NextOpen {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_open
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_open = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_open.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.is_pending_open
     }
@@ -553,18 +459,6 @@ impl store::Next for NextOpen {
 }
 
 impl store::Next for NextResetExpire {
-    fn next(stream: &Stream) -> Option<store::Key> {
-        stream.next_reset_expire
-    }
-
-    fn set_next(stream: &mut Stream, key: Option<store::Key>) {
-        stream.next_reset_expire = key;
-    }
-
-    fn take_next(stream: &mut Stream) -> Option<store::Key> {
-        stream.next_reset_expire.take()
-    }
-
     fn is_queued(stream: &Stream) -> bool {
         stream.reset_at.is_some()
     }

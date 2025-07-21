@@ -2,9 +2,11 @@ use super::*;
 
 use indexmap::{self, IndexMap};
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem;
 use std::ops;
 
 /// Storage for streams
@@ -24,39 +26,22 @@ pub(super) struct Ptr<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Key {
     index: SlabIndex,
-    /// Keep the stream ID in the key as an ABA guard, since slab indices
-    /// could be re-used with a new stream.
     stream_id: StreamId,
 }
 
-// We can never have more than `StreamId::MAX` streams in the store,
-// so we can save a smaller index (u32 vs usize).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SlabIndex(u32);
 
 #[derive(Debug)]
 pub(super) struct Queue<N> {
-    indices: Option<store::Indices>,
+    queue: VecDeque<StreamId>,
     _p: PhantomData<N>,
 }
 
 pub(super) trait Next {
-    fn next(stream: &Stream) -> Option<Key>;
-
-    fn set_next(stream: &mut Stream, key: Option<Key>);
-
-    fn take_next(stream: &mut Stream) -> Option<Key>;
-
     fn is_queued(stream: &Stream) -> bool;
 
     fn set_queued(stream: &mut Stream, val: bool);
-}
-
-/// A linked list
-#[derive(Debug, Clone, Copy)]
-struct Indices {
-    pub head: Key,
-    pub tail: Key,
 }
 
 pub(super) enum Entry<'a> {
@@ -75,6 +60,8 @@ pub(super) struct VacantEntry<'a> {
 
 pub(super) trait Resolve {
     fn resolve(&mut self, key: Key) -> Ptr;
+
+    fn store(&mut self) -> &mut Store;
 }
 
 // ===== impl Store =====
@@ -105,7 +92,6 @@ impl Store {
     pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr {
         let index = SlabIndex(self.slab.insert(val) as u32);
         assert!(self.ids.insert(id, index).is_none());
-
         Ptr {
             key: Key {
                 index,
@@ -196,17 +182,16 @@ impl Resolve for Store {
     fn resolve(&mut self, key: Key) -> Ptr {
         Ptr { key, store: self }
     }
+
+    fn store(&mut self) -> &mut Store {
+        self
+    }
 }
 
 impl Store {
     #[cfg(feature = "unstable")]
     pub fn num_active_streams(&self) -> usize {
         self.ids.len()
-    }
-
-    #[cfg(feature = "unstable")]
-    pub fn num_wired_streams(&self) -> usize {
-        self.slab.len()
     }
 }
 
@@ -234,14 +219,14 @@ where
 {
     pub fn new() -> Self {
         Queue {
-            indices: None,
+            queue: VecDeque::new(),
             _p: PhantomData,
         }
     }
 
     pub fn take(&mut self) -> Self {
         Queue {
-            indices: self.indices.take(),
+            queue: mem::take(&mut self.queue),
             _p: PhantomData,
         }
     }
@@ -259,30 +244,7 @@ where
 
         N::set_queued(stream, true);
 
-        // The next pointer shouldn't be set
-        debug_assert!(N::next(stream).is_none());
-
-        // Queue the stream
-        match self.indices {
-            Some(ref mut idxs) => {
-                tracing::trace!(" -> existing entries");
-
-                // Update the current tail node to point to `stream`
-                let key = stream.key();
-                N::set_next(&mut stream.resolve(idxs.tail), Some(key));
-
-                // Update the tail pointer
-                idxs.tail = stream.key();
-            }
-            None => {
-                tracing::trace!(" -> first entry");
-                self.indices = Some(store::Indices {
-                    head: stream.key(),
-                    tail: stream.key(),
-                });
-            }
-        }
-
+        self.queue.push_back(stream.key().stream_id);
         true
     }
 
@@ -298,52 +260,19 @@ where
         }
 
         N::set_queued(stream, true);
-
-        // The next pointer shouldn't be set
-        debug_assert!(N::next(stream).is_none());
-
-        // Queue the stream
-        match self.indices {
-            Some(ref mut idxs) => {
-                tracing::trace!(" -> existing entries");
-
-                // Update the provided stream to point to the head node
-                let head_key = stream.resolve(idxs.head).key();
-                N::set_next(stream, Some(head_key));
-
-                // Update the head pointer
-                idxs.head = stream.key();
-            }
-            None => {
-                tracing::trace!(" -> first entry");
-                self.indices = Some(store::Indices {
-                    head: stream.key(),
-                    tail: stream.key(),
-                });
-            }
-        }
-
+        self.queue.push_front(stream.key().stream_id);
         true
     }
 
-    pub fn pop<'a, R>(&mut self, store: &'a mut R) -> Option<store::Ptr<'a>>
+    pub fn pop<'a, R>(&mut self, resolve: &'a mut R) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
     {
-        if let Some(mut idxs) = self.indices {
-            let mut stream = store.resolve(idxs.head);
-
-            if idxs.head == idxs.tail {
-                assert!(N::next(&stream).is_none());
-                self.indices = None;
-            } else {
-                idxs.head = N::take_next(&mut stream).unwrap();
-                self.indices = Some(idxs);
-            }
-
+        if let Some(stream_id) = self.queue.pop_front() {
+            let store = resolve.store();
+            let mut stream = store.find_mut(&stream_id).unwrap();
             debug_assert!(N::is_queued(&stream));
             N::set_queued(&mut stream, false);
-
             return Some(stream);
         }
 
@@ -351,18 +280,20 @@ where
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indices.is_none()
+        self.queue.is_empty()
     }
 
-    pub fn pop_if<'a, R, F>(&mut self, store: &'a mut R, f: F) -> Option<store::Ptr<'a>>
+    pub fn pop_if<'a, R, F>(&mut self, resolve: &'a mut R, f: F) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
         F: Fn(&Stream) -> bool,
     {
-        if let Some(idxs) = self.indices {
-            let should_pop = f(&store.resolve(idxs.head));
+        if let Some(stream_id) = self.queue.front() {
+            let store = resolve.store();
+            let stream = store.find_mut(stream_id).unwrap();
+            let should_pop = f(&stream);
             if should_pop {
-                return self.pop(store);
+                return self.pop(resolve)
             }
         }
 
@@ -387,7 +318,6 @@ impl<'a> Ptr<'a> {
         // The stream must have been unlinked before this point
         debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
 
-        // Remove the stream state
         let stream = self.store.slab.remove(self.key.index.0 as usize);
         assert_eq!(stream.id, self.key.stream_id);
         stream.id
@@ -409,6 +339,10 @@ impl<'a> Resolve for Ptr<'a> {
             key,
             store: &mut *self.store,
         }
+    }
+
+    fn store(&mut self) -> &mut Store {
+        self.store_mut()
     }
 }
 
