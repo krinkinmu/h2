@@ -268,7 +268,7 @@ impl Prioritize {
                     let _res = stream.ref_mut().send_flow.claim_capacity(diff);
                     debug_assert!(_res.is_ok());
 
-                    self.assign_connection_capacity(diff, stream, counts);
+                    self.assign_connection_capacity(diff, stream.store_mut(), counts);
                 }
             }
             Ordering::Greater => {
@@ -341,7 +341,7 @@ impl Prioritize {
             let _res = stream.ref_mut().send_flow.claim_capacity(available);
             debug_assert!(_res.is_ok());
             // Re-assign all capacity to the connection
-            self.assign_connection_capacity(available, stream, counts);
+            self.assign_connection_capacity(available, stream.store_mut(), counts);
         }
     }
 
@@ -361,7 +361,7 @@ impl Prioritize {
                 .claim_capacity(reserved)
                 .expect("window size should be greater than reserved");
 
-            self.assign_connection_capacity(reserved, stream, counts);
+            self.assign_connection_capacity(reserved, stream.store_mut(), counts);
         }
     }
 
@@ -375,13 +375,12 @@ impl Prioritize {
         }
     }
 
-    pub fn assign_connection_capacity<R>(
+    pub fn assign_connection_capacity(
         &mut self,
         inc: WindowSize,
-        store: &mut R,
+        store: &mut Store,
         counts: &mut Counts,
-    ) where
-        R: Resolve,
+    )
     {
         let span = tracing::trace_span!("assign_connection_capacity", inc);
         let _e = span.enter();

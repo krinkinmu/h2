@@ -340,19 +340,6 @@ impl<'a> Ptr<'a> {
     }
 }
 
-impl<'a> Resolve for Ptr<'a> {
-    fn resolve(&mut self, key: Key) -> Ptr {
-        Ptr {
-            key,
-            store: &mut *self.store,
-        }
-    }
-
-    fn store(&mut self) -> &mut Store {
-        self.store_mut()
-    }
-}
-
 impl<'a> fmt::Debug for Ptr<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         (*self.borrow()).fmt(fmt)
