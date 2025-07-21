@@ -7,7 +7,6 @@ use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
-use std::ops;
 
 /// Storage for streams
 #[derive(Debug)]
@@ -237,12 +236,12 @@ where
     pub fn push(&mut self, stream: &mut store::Ptr) -> bool {
         tracing::trace!("Queue::push_back");
 
-        if N::is_queued(stream) {
+        if N::is_queued(stream.borrow()) {
             tracing::trace!(" -> already queued");
             return false;
         }
 
-        N::set_queued(stream, true);
+        N::set_queued(stream.ref_mut(), true);
 
         self.queue.push_back(stream.key().stream_id);
         true
@@ -254,12 +253,12 @@ where
     pub fn push_front(&mut self, stream: &mut store::Ptr) -> bool {
         tracing::trace!("Queue::push_front");
 
-        if N::is_queued(stream) {
+        if N::is_queued(stream.borrow()) {
             tracing::trace!(" -> already queued");
             return false;
         }
 
-        N::set_queued(stream, true);
+        N::set_queued(stream.ref_mut(), true);
         self.queue.push_front(stream.key().stream_id);
         true
     }
@@ -271,8 +270,8 @@ where
         if let Some(stream_id) = self.queue.pop_front() {
             let store = resolve.store();
             let mut stream = store.find_mut(&stream_id).unwrap();
-            debug_assert!(N::is_queued(&stream));
-            N::set_queued(&mut stream, false);
+            debug_assert!(N::is_queued(stream.borrow()));
+            N::set_queued(stream.ref_mut(), false);
             return Some(stream);
         }
 
@@ -291,7 +290,7 @@ where
         if let Some(stream_id) = self.queue.front() {
             let store = resolve.store();
             let stream = store.find_mut(stream_id).unwrap();
-            let should_pop = f(&stream);
+            let should_pop = f(stream.borrow());
             if should_pop {
                 return self.pop(resolve)
             }
@@ -331,6 +330,14 @@ impl<'a> Ptr<'a> {
         let id = self.key.stream_id;
         self.store.ids.swap_remove(&id);
     }
+
+    pub fn borrow(&self) -> &Stream {
+        self.store.index(self.key)
+    }
+
+    pub fn ref_mut(&mut self) -> &mut Stream {
+        self.store.index_mut(self.key)
+    }
 }
 
 impl<'a> Resolve for Ptr<'a> {
@@ -346,23 +353,9 @@ impl<'a> Resolve for Ptr<'a> {
     }
 }
 
-impl<'a> ops::Deref for Ptr<'a> {
-    type Target = Stream;
-
-    fn deref(&self) -> &Stream {
-        self.store.index(self.key)
-    }
-}
-
-impl<'a> ops::DerefMut for Ptr<'a> {
-    fn deref_mut(&mut self) -> &mut Stream {
-        self.store.index_mut(self.key)
-    }
-}
-
 impl<'a> fmt::Debug for Ptr<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        (**self).fmt(fmt)
+        (*self.borrow()).fmt(fmt)
     }
 }
 

@@ -134,15 +134,15 @@ where
             let stream = &mut me.store.resolve(key);
             tracing::trace!(
                 "next_incoming; id={:?}, state={:?}",
-                stream.id,
-                stream.state
+                stream.borrow().id,
+                stream.borrow().state
             );
             // TODO: ideally, OpaqueStreamRefs::new would do this, but we're holding
             // the lock, so it can't.
             me.refs += 1;
 
             // Pending-accepted remotely-reset streams are counted.
-            if stream.state.is_remote_reset() {
+            if stream.borrow().state.is_remote_reset() {
                 me.counts.dec_num_remote_reset_streams();
             }
 
@@ -244,7 +244,7 @@ where
         // If that stream is still pending, the Client isn't allowed to
         // queue up another pending stream. They should use `poll_ready`.
         if let Some(stream) = pending {
-            if me.store.resolve(stream.key).is_pending_open {
+            if me.store.resolve(stream.key).borrow().is_pending_open {
                 return Err(UserError::Rejected.into());
             }
         }
@@ -290,7 +290,7 @@ where
 
         // Given that the stream has been initialized, it should not be in the
         // closed state.
-        debug_assert!(!stream.state.is_closed());
+        debug_assert!(!stream.borrow().state.is_closed());
 
         // TODO: ideally, OpaqueStreamRefs::new would do this, but we're holding
         // the lock, so it can't.
@@ -468,11 +468,11 @@ impl Inner {
 
         let stream = self.store.resolve(key);
 
-        if stream.state.is_local_error() {
+        if stream.borrow().state.is_local_error() {
             // Locally reset streams must ignore frames "for some time".
             // This is because the remote may have sent trailers before
             // receiving the RST_STREAM frame.
-            tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.id);
+            tracing::trace!("recv_headers; ignoring trailers on {:?}", stream.borrow().id);
             return Ok(());
         }
 
@@ -482,11 +482,11 @@ impl Inner {
         self.counts.transition(stream, |counts, stream| {
             tracing::trace!(
                 "recv_headers; stream={:?}; state={:?}",
-                stream.id,
-                stream.state
+                stream.borrow().id,
+                stream.borrow().state
             );
 
-            let res = if stream.state.is_recv_headers() {
+            let res = if stream.borrow().state.is_recv_headers() {
                 match actions.recv.recv_headers(frame, stream, counts) {
                     Ok(()) => Ok(()),
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
@@ -505,7 +505,7 @@ impl Inner {
 
                             Ok(())
                         } else {
-                            Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR))
+                            Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR))
                         }
                     },
                     Err(RecvHeaderBlockError::State(err)) => Err(err),
@@ -514,8 +514,8 @@ impl Inner {
                 if !frame.is_end_stream() {
                     // Receiving trailers that don't set EOS is a "malformed"
                     // message. Malformed messages are a stream error.
-                    proto_err!(stream: "recv_headers: trailers frame was not EOS; stream={:?}", stream.id);
-                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
+                    proto_err!(stream: "recv_headers: trailers frame was not EOS; stream={:?}", stream.borrow().id);
+                    return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR));
                 }
 
                 actions.recv.recv_trailers(frame, stream)
@@ -621,9 +621,9 @@ impl Inner {
         let actions = &mut self.actions;
 
         self.counts.transition(stream, |counts, stream| {
-            actions.recv.recv_reset(frame, stream, counts)?;
+            actions.recv.recv_reset(frame, stream.ref_mut(), counts)?;
             actions.send.handle_error(&send_buffer.inner, stream, counts);
-            assert!(stream.state.is_closed());
+            assert!(stream.borrow().state.is_closed());
             Ok(())
         })
     }
@@ -672,7 +672,7 @@ impl Inner {
 
         self.store.for_each(|stream| {
             counts.transition(stream, |counts, stream| {
-                actions.recv.handle_error(&err, &mut *stream);
+                actions.recv.handle_error(&err, stream.ref_mut());
                 actions.send.handle_error(&send_buffer.inner, stream, counts);
             })
         });
@@ -697,9 +697,9 @@ impl Inner {
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
 
         self.store.for_each(|stream| {
-            if stream.id > last_stream_id {
+            if stream.borrow().id > last_stream_id {
                 counts.transition(stream, |counts, stream| {
-                    actions.recv.handle_error(&err, &mut *stream);
+                    actions.recv.handle_error(&err, stream.ref_mut());
                     actions.send.handle_error(&send_buffer.inner, stream, counts);
                 })
             }
@@ -733,7 +733,7 @@ impl Inner {
                 }
 
                 // The stream must be receive open
-                if !stream.state.ensure_recv_open()? {
+                if !stream.borrow().state.ensure_recv_open()? {
                     proto_err!(conn: "recv_push_promise: initiating stream is not opened");
                     return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
                 }
@@ -804,8 +804,8 @@ impl Inner {
             ppp.push(&mut self.store.resolve(child));
 
             let parent = &mut self.store.resolve(parent_key);
-            parent.pending_push_promises = ppp;
-            parent.notify_push();
+            parent.ref_mut().pending_push_promises = ppp;
+            parent.ref_mut().notify_push();
         };
 
         Ok(())
@@ -833,7 +833,7 @@ impl Inner {
 
         self.store.for_each(|stream| {
             counts.transition(stream, |counts, stream| {
-                actions.recv.recv_eof(stream);
+                actions.recv.recv_eof(stream.ref_mut());
 
                 // This handles resetting send state associated with the
                 // stream
@@ -939,9 +939,9 @@ where
 
         if let Some(pending) = pending {
             let mut stream = me.store.resolve(pending.key);
-            tracing::trace!("poll_pending_open; stream = {:?}", stream.is_pending_open);
-            if stream.is_pending_open {
-                stream.wait_send(cx);
+            tracing::trace!("poll_pending_open; stream = {:?}", stream.borrow().is_pending_open);
+            if stream.borrow().is_pending_open {
+                stream.ref_mut().wait_send(cx);
                 return Poll::Pending;
             }
         }
@@ -1050,7 +1050,7 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the data frame
-            let mut frame = frame::Data::new(stream.id, data);
+            let mut frame = frame::Data::new(stream.borrow().id, data);
             frame.set_end_stream(end_stream);
 
             // Send the data frame
@@ -1069,7 +1069,7 @@ impl<B> StreamRef<B> {
 
         me.counts.transition(stream, |counts, stream| {
             // Create the trailers frame
-            let frame = frame::Headers::trailers(stream.id, trailers);
+            let frame = frame::Headers::trailers(stream.borrow().id, trailers);
 
             // Send the trailers frame
             actions
@@ -1102,7 +1102,7 @@ impl<B> StreamRef<B> {
         let actions = &mut me.actions;
 
         me.counts.transition(stream, |counts, stream| {
-            let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
+            let frame = server::Peer::convert_send_message(stream.borrow().id, response, end_of_stream);
 
             actions
                 .send
@@ -1131,15 +1131,15 @@ impl<B> StreamRef<B> {
                     actions.recv.init_window_sz(),
                 ),
             );
-            child_stream.state.reserve_local()?;
-            child_stream.is_pending_push = true;
+            child_stream.ref_mut().state.reserve_local()?;
+            child_stream.ref_mut().is_pending_push = true;
             child_stream.key()
         };
 
         let pushed = {
             let mut stream = me.store.resolve(self.opaque.key);
 
-            let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
+            let frame = crate::server::Peer::convert_push_message(stream.borrow().id, promised_id, request)?;
 
             actions
                 .send
@@ -1181,7 +1181,7 @@ impl<B> StreamRef<B> {
     /// Called by a client to see if the current stream is pending open
     pub fn is_pending_open(&self) -> bool {
         let mut me = self.opaque.inner.lock().unwrap();
-        me.store.resolve(self.opaque.key).is_pending_open
+        me.store.resolve(self.opaque.key).borrow().is_pending_open
     }
 
     /// Request capacity to send data
@@ -1227,7 +1227,7 @@ impl<B> StreamRef<B> {
 
         let mut stream = me.store.resolve(self.opaque.key);
 
-        me.actions.send.poll_reset(cx, &mut stream, mode)
+        me.actions.send.poll_reset(cx, stream.ref_mut(), mode)
     }
 
     pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
@@ -1252,7 +1252,7 @@ impl<B> Clone for StreamRef<B> {
 
 impl OpaqueStreamRef {
     fn new(inner: Arc<Mutex<Inner>>, stream: &mut store::Ptr) -> OpaqueStreamRef {
-        stream.ref_inc();
+        stream.ref_mut().ref_inc();
         OpaqueStreamRef {
             inner,
             key: stream.key(),
@@ -1302,7 +1302,7 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_data(cx, &mut stream)
+        me.actions.recv.poll_data(cx, stream.ref_mut())
     }
 
     pub fn poll_trailers(&mut self, cx: &Context) -> Poll<Option<Result<HeaderMap, proto::Error>>> {
@@ -1311,7 +1311,7 @@ impl OpaqueStreamRef {
 
         let mut stream = me.store.resolve(self.key);
 
-        me.actions.recv.poll_trailers(cx, &mut stream)
+        me.actions.recv.poll_trailers(cx, stream.ref_mut())
     }
 
     pub(crate) fn available_recv_capacity(&self) -> isize {
@@ -1348,9 +1348,10 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let mut stream = me.store.resolve(self.key);
+        let mut ptr = me.store.resolve(self.key);
+        let stream = ptr.ref_mut();
         stream.is_recv = false;
-        me.actions.recv.clear_recv_buffer(&mut stream);
+        me.actions.recv.clear_recv_buffer(stream);
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1386,7 +1387,7 @@ impl Clone for OpaqueStreamRef {
     fn clone(&self) -> Self {
         // Increment the ref count
         let mut inner = self.inner.lock().unwrap();
-        inner.store.resolve(self.key).ref_inc();
+        inner.store.resolve(self.key).ref_mut().ref_inc();
         inner.refs += 1;
 
         OpaqueStreamRef {
@@ -1423,7 +1424,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     tracing::trace!("drop_stream_ref; stream={:?}", stream);
 
     // decrement the stream's ref count by 1.
-    stream.ref_dec();
+    stream.ref_mut().ref_dec();
 
     let actions = &mut me.actions;
 
@@ -1431,7 +1432,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     // closed (does not have to go through logic below
     // of canceling the stream), we should notify the task
     // (connection) so that it can close properly
-    if stream.ref_count == 0 && stream.is_closed() {
+    if stream.borrow().ref_count == 0 && stream.borrow().is_closed() {
         if let Some(task) = actions.task.lock().unwrap().take() {
             task.wake();
         }
@@ -1440,7 +1441,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
     me.counts.transition(stream, |counts, stream| {
         maybe_cancel(stream, actions, counts);
 
-        if stream.ref_count == 0 {
+        if stream.borrow().ref_count == 0 {
             // Release any recv window back to connection, no one can access
             // it anymore.
             actions
@@ -1448,7 +1449,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
                 .release_closed_capacity(stream, &actions.task);
 
             // We won't be able to reach our push promises anymore
-            let mut ppp = stream.pending_push_promises.take();
+            let mut ppp = stream.ref_mut().pending_push_promises.take();
             while let Some(promise) = ppp.pop(stream.store_mut()) {
                 counts.transition(promise, |counts, stream| {
                     maybe_cancel(stream, actions, counts);
@@ -1459,13 +1460,13 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
 }
 
 fn maybe_cancel(stream: &mut store::Ptr, actions: &mut Actions, counts: &mut Counts) {
-    if stream.is_canceled_interest() {
+    if stream.borrow().is_canceled_interest() {
         // Server is allowed to early respond without fully consuming the client input stream
         // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
         // Some other http2 implementation may interpret other error code as fatal if not respected (i.e: nginx https://trac.nginx.org/nginx/ticket/2376)
         let reason = if counts.peer().is_server()
-            && stream.state.is_send_closed()
-            && stream.state.is_recv_streaming()
+            && stream.borrow().state.is_send_closed()
+            && stream.borrow().state.is_recv_streaming()
         {
             Reason::NO_ERROR
         } else {
@@ -1513,7 +1514,7 @@ impl Actions {
             );
             self.recv.enqueue_reset_expiration(stream, counts);
             // if a RecvStream is parked, ensure it's notified
-            stream.notify_recv();
+            stream.ref_mut().notify_recv();
         });
     }
 
@@ -1525,7 +1526,7 @@ impl Actions {
         res: Result<(), Error>,
     ) -> Result<(), Error> {
         if let Err(Error::Reset(stream_id, reason, initiator)) = res {
-            debug_assert_eq!(stream_id, stream.id);
+            debug_assert_eq!(stream_id, stream.borrow().id);
 
             if counts.can_inc_num_local_error_resets() {
                 counts.inc_num_local_error_resets();
@@ -1535,7 +1536,7 @@ impl Actions {
                     .send_reset(reason, initiator, buffer, stream, counts, &self.task);
                 self.recv.enqueue_reset_expiration(stream, counts);
                 // if a RecvStream is parked, ensure it's notified
-                stream.notify_recv();
+                stream.ref_mut().notify_recv();
                 Ok(())
             } else {
                 tracing::warn!(

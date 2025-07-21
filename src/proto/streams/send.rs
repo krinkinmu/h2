@@ -142,10 +142,10 @@ impl Send {
         let end_stream = frame.is_end_stream();
 
         // Update the state
-        stream.state.send_open(end_stream)?;
+        stream.ref_mut().state.send_open(end_stream)?;
 
         let mut pending_open = false;
-        if counts.peer().is_local_init(frame.stream_id()) && !stream.is_pending_push {
+        if counts.peer().is_local_init(frame.stream_id()) && !stream.borrow().is_pending_push {
             self.prioritize.queue_open(stream);
             pending_open = true;
         }
@@ -178,10 +178,10 @@ impl Send {
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
     ) {
-        let is_reset = stream.state.is_reset();
-        let is_closed = stream.state.is_closed();
-        let is_empty = stream.pending_send.is_empty();
-        let stream_id = stream.id;
+        let is_reset = stream.borrow().state.is_reset();
+        let is_closed = stream.borrow().state.is_closed();
+        let is_empty = stream.borrow().pending_send.is_empty();
+        let stream_id = stream.borrow().id;
 
         tracing::trace!(
             "send_reset(..., reason={:?}, initiator={:?}, stream={:?}, ..., \
@@ -194,7 +194,7 @@ impl Send {
             is_reset,
             is_closed,
             is_empty,
-            stream.state
+            stream.borrow().state
         );
 
         if is_reset {
@@ -207,7 +207,7 @@ impl Send {
         }
 
         // Transition the state to reset no matter what.
-        stream.set_reset(reason, initiator);
+        stream.ref_mut().set_reset(reason, initiator);
 
         // If closed AND the send queue is flushed, then the stream cannot be
         // reset explicitly, either. Implicit resets can still be queued.
@@ -226,7 +226,7 @@ impl Send {
         // `reclaim_all_capacity`.
         self.prioritize.clear_queue(buffer, stream);
 
-        let frame = frame::Reset::new(stream.id, reason);
+        let frame = frame::Reset::new(stream.borrow().id, reason);
 
         tracing::trace!("send_reset -- queueing; frame={:?}", frame);
         self.prioritize
@@ -241,12 +241,12 @@ impl Send {
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
     ) {
-        if stream.state.is_closed() {
+        if stream.borrow().state.is_closed() {
             // Stream is already closed, nothing more to do
             return;
         }
 
-        stream.state.set_scheduled_reset(reason);
+        stream.ref_mut().state.set_scheduled_reset(reason);
 
         self.prioritize.reclaim_reserved_capacity(stream, counts);
         self.prioritize.schedule_send(stream, task);
@@ -276,11 +276,11 @@ impl Send {
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         // TODO: Should this logic be moved into state.rs?
-        if !stream.state.is_send_streaming() {
+        if !stream.borrow().state.is_send_streaming() {
             return Err(UserError::UnexpectedFrameType);
         }
 
-        stream.state.send_close();
+        stream.ref_mut().state.send_close();
 
         tracing::trace!("send_trailers -- queuing; frame={:?}", frame);
         self.prioritize
@@ -323,23 +323,23 @@ impl Send {
         cx: &Context,
         stream: &mut store::Ptr,
     ) -> Poll<Option<Result<WindowSize, UserError>>> {
-        if !stream.state.is_send_streaming() {
+        if !stream.borrow().state.is_send_streaming() {
             return Poll::Ready(None);
         }
 
-        if !stream.send_capacity_inc {
-            stream.wait_send(cx);
+        if !stream.borrow().send_capacity_inc {
+            stream.ref_mut().wait_send(cx);
             return Poll::Pending;
         }
 
-        stream.send_capacity_inc = false;
+        stream.ref_mut().send_capacity_inc = false;
 
         Poll::Ready(Some(Ok(self.capacity(stream))))
     }
 
     /// Current available stream send capacity
     pub fn capacity(&self, stream: &mut store::Ptr) -> WindowSize {
-        stream.capacity(self.prioritize.max_buffer_size())
+        stream.ref_mut().capacity(self.prioritize.max_buffer_size())
     }
 
     pub fn poll_reset(
@@ -465,7 +465,7 @@ impl Send {
 
                     let mut total_reclaimed = 0;
                     store.try_for_each(|mut stream| {
-                        let stream = &mut *stream;
+                        let stream = stream.ref_mut();
 
                         if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
                             tracing::trace!(

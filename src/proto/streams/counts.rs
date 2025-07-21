@@ -108,11 +108,11 @@ impl Counts {
     /// Panics on failure as this should have been validated before hand.
     pub fn inc_num_recv_streams(&mut self, stream: &mut store::Ptr) {
         assert!(self.can_inc_num_recv_streams());
-        assert!(!stream.is_counted);
+        assert!(!stream.borrow().is_counted);
 
         // Increment the number of remote initiated streams
         self.num_recv_streams += 1;
-        stream.is_counted = true;
+        stream.ref_mut().is_counted = true;
     }
 
     /// Returns true if the send stream concurrency can be incremented
@@ -127,11 +127,11 @@ impl Counts {
     /// Panics on failure as this should have been validated before hand.
     pub fn inc_num_send_streams(&mut self, stream: &mut store::Ptr) {
         assert!(self.can_inc_num_send_streams());
-        assert!(!stream.is_counted);
+        assert!(!stream.borrow().is_counted);
 
         // Increment the number of remote initiated streams
         self.num_send_streams += 1;
-        stream.is_counted = true;
+        stream.ref_mut().is_counted = true;
     }
 
     /// Returns true if the number of pending reset streams can be incremented.
@@ -196,7 +196,7 @@ impl Counts {
         F: FnOnce(&mut Self, &mut store::Ptr) -> U,
     {
         // TODO: Does this need to be computed before performing the action?
-        let is_pending_reset = stream.is_pending_reset_expiration();
+        let is_pending_reset = stream.borrow().is_pending_reset_expiration();
 
         // Run the action
         let ret = f(self, &mut stream);
@@ -212,32 +212,32 @@ impl Counts {
             "transition_after; stream={:?}; state={:?}; is_closed={:?}; \
              pending_send_empty={:?}; buffered_send_data={}; \
              num_recv={}; num_send={}",
-            stream.id,
-            stream.state,
-            stream.is_closed(),
-            stream.pending_send.is_empty(),
-            stream.buffered_send_data,
+            stream.borrow().id,
+            stream.borrow().state,
+            stream.borrow().is_closed(),
+            stream.borrow().pending_send.is_empty(),
+            stream.borrow().buffered_send_data,
             self.num_recv_streams,
             self.num_send_streams
         );
 
-        if stream.is_closed() {
-            if !stream.is_pending_reset_expiration() {
+        if stream.borrow().is_closed() {
+            if !stream.borrow().is_pending_reset_expiration() {
                 stream.unlink();
                 if is_reset_counted {
                     self.dec_num_reset_streams();
                 }
             }
 
-            if !stream.state.is_scheduled_reset() && stream.is_counted {
-                tracing::trace!("dec_num_streams; stream={:?}", stream.id);
+            if !stream.borrow().state.is_scheduled_reset() && stream.borrow().is_counted {
+                tracing::trace!("dec_num_streams; stream={:?}", stream.borrow().id);
                 // Decrement the number of active streams.
                 self.dec_num_streams(&mut stream);
             }
         }
 
         // Release the stream if it requires releasing
-        if stream.is_released() {
+        if stream.borrow().is_released() {
             stream.remove();
         }
     }
@@ -255,16 +255,16 @@ impl Counts {
     }
 
     fn dec_num_streams(&mut self, stream: &mut store::Ptr) {
-        assert!(stream.is_counted);
+        assert!(stream.borrow().is_counted);
 
-        if self.peer.is_local_init(stream.id) {
+        if self.peer.is_local_init(stream.borrow().id) {
             assert!(self.num_send_streams > 0);
             self.num_send_streams -= 1;
-            stream.is_counted = false;
+            stream.ref_mut().is_counted = false;
         } else {
             assert!(self.num_recv_streams > 0);
             self.num_recv_streams -= 1;
-            stream.is_counted = false;
+            stream.ref_mut().is_counted = false;
         }
     }
 
