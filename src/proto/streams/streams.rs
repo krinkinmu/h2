@@ -800,7 +800,7 @@ impl Inner {
         };
         // If we're successful, push the headers and stream...
         if let Some(child) = child_key {
-            let mut ppp = self.store[parent_key].pending_push_promises.take();
+            let mut ppp = self.store.index_mut(parent_key).pending_push_promises.take();
             ppp.push(&mut self.store.resolve(child));
 
             let parent = &mut self.store.resolve(parent_key);
@@ -1318,7 +1318,7 @@ impl OpaqueStreamRef {
         let me = self.inner.lock().unwrap();
         let me = &*me;
 
-        let stream = &me.store[self.key];
+        let stream = &me.store.index(self.key);
         stream.recv_flow.available().into()
     }
 
@@ -1326,7 +1326,7 @@ impl OpaqueStreamRef {
         let me = self.inner.lock().unwrap();
         let me = &*me;
 
-        let stream = &me.store[self.key];
+        let stream = &me.store.index(self.key);
         stream.in_flight_recv_data
     }
 
@@ -1354,7 +1354,7 @@ impl OpaqueStreamRef {
     }
 
     pub fn stream_id(&self) -> StreamId {
-        self.inner.lock().unwrap().store[self.key].id
+        self.inner.lock().unwrap().store.index(self.key).id
     }
 }
 
@@ -1364,7 +1364,7 @@ impl fmt::Debug for OpaqueStreamRef {
 
         match self.inner.try_lock() {
             Ok(me) => {
-                let stream = &me.store[self.key];
+                let stream = &me.store.index(self.key);
                 fmt.debug_struct("OpaqueStreamRef")
                     .field("stream_id", &stream.id)
                     .field("ref_count", &stream.ref_count)

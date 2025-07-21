@@ -174,35 +174,27 @@ impl Store {
 
         Ok(())
     }
+
+    pub fn index(&self, key: Key) -> &Stream {
+        self.slab.get(key.index.0 as usize)
+            .filter(|s| s.id == key.stream_id)
+            .unwrap_or_else(|| {
+                panic!("dangling store key for stream_id={:?}", key.stream_id);
+            })
+    }
+
+    pub fn index_mut(&mut self, key: Key) -> &mut Stream {
+        self.slab.get_mut(key.index.0 as usize)
+            .filter(|s| s.id == key.stream_id)
+            .unwrap_or_else(|| {
+                panic!("dangling store key for stream_id={:?}", key.stream_id);
+            })
+    }
 }
 
 impl Resolve for Store {
     fn resolve(&mut self, key: Key) -> Ptr {
         Ptr { key, store: self }
-    }
-}
-
-impl ops::Index<Key> for Store {
-    type Output = Stream;
-
-    fn index(&self, key: Key) -> &Self::Output {
-        self.slab
-            .get(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
-            .unwrap_or_else(|| {
-                panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
-    }
-}
-
-impl ops::IndexMut<Key> for Store {
-    fn index_mut(&mut self, key: Key) -> &mut Self::Output {
-        self.slab
-            .get_mut(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
-            .unwrap_or_else(|| {
-                panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
     }
 }
 
@@ -424,13 +416,13 @@ impl<'a> ops::Deref for Ptr<'a> {
     type Target = Stream;
 
     fn deref(&self) -> &Stream {
-        &self.store[self.key]
+        self.store.index(self.key)
     }
 }
 
 impl<'a> ops::DerefMut for Ptr<'a> {
     fn deref_mut(&mut self) -> &mut Stream {
-        &mut self.store[self.key]
+        self.store.index_mut(self.key)
     }
 }
 
