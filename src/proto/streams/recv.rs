@@ -156,11 +156,11 @@ impl Recv {
     pub fn recv_headers(
         &mut self,
         frame: frame::Headers,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
         counts: &mut Counts,
     ) -> Result<(), RecvHeaderBlockError<Option<frame::Headers>>> {
         tracing::trace!("opening stream; init_window={}", self.init_window_sz);
-        let is_initial = stream.ref_mut().state.recv_open(&frame)?;
+        let is_initial = stream.state.recv_open(&frame)?;
 
         if is_initial {
             // TODO: be smarter about this logic
@@ -172,7 +172,7 @@ impl Recv {
             counts.inc_num_recv_streams(stream);
         }
 
-        if !stream.borrow().content_length.is_head() {
+        if !stream.content_length.is_head() {
             use super::stream::ContentLength;
             use http::header;
 
@@ -180,12 +180,12 @@ impl Recv {
                 let content_length = match frame::parse_u64(content_length.as_bytes()) {
                     Ok(v) => v,
                     Err(_) => {
-                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.borrow().id);
-                        return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR).into());
+                        proto_err!(stream: "could not parse content-length; stream={:?}", stream.id);
+                        return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
                     }
                 };
 
-                stream.ref_mut().content_length = ContentLength::Remaining(content_length);
+                stream.content_length = ContentLength::Remaining(content_length);
                 // END_STREAM on headers frame with non-zero content-length is malformed.
                 // https://datatracker.ietf.org/doc/html/rfc9113#section-8.1.1
                 if frame.is_end_stream()
@@ -195,8 +195,8 @@ impl Recv {
                         .status
                         .map_or(true, |status| status != 204 && status != 304)
                 {
-                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.borrow().id);
-                    return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR).into());
+                    proto_err!(stream: "recv_headers with END_STREAM: content-length is not zero; stream={:?};", stream.id);
+                    return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
                 }
             }
         }
@@ -216,11 +216,11 @@ impl Recv {
             tracing::debug!(
                 "stream error REQUEST_HEADER_FIELDS_TOO_LARGE -- \
                  recv_headers: frame is over size; stream={:?}",
-                stream.borrow().id
+                stream.id
             );
             return if counts.peer().is_server() && is_initial {
                 let mut res = frame::Headers::new(
-                    stream.borrow().id,
+                    stream.id,
                     frame::Pseudo::response(::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
                     HeaderMap::new(),
                 );
@@ -238,13 +238,13 @@ impl Recv {
             && counts.peer().is_server()
             && !self.is_extended_connect_protocol_enabled
         {
-            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.borrow().id);
-            return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR).into());
+            proto_err!(stream: "cannot use :protocol if extended connect protocol is disabled; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
         }
 
         if pseudo.status.is_some() && counts.peer().is_server() {
-            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.borrow().id);
-            return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR).into());
+            proto_err!(stream: "cannot use :status header for requests; stream={:?}", stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR).into());
         }
 
         if !pseudo.is_informational() {
@@ -254,10 +254,9 @@ impl Recv {
 
             // Push the frame onto the stream's recv buffer
             stream
-                .ref_mut()
                 .pending_recv
                 .push_back(&mut self.buffer, Event::Headers(message));
-            stream.ref_mut().notify_recv();
+            stream.notify_recv();
 
             // Only servers can receive a headers frame that initiates the stream.
             // This is verified in `Streams` before calling this function.
@@ -277,10 +276,10 @@ impl Recv {
     ///
     /// Panics if `stream.pending_recv` has no `Event::Headers` queued.
     ///
-    pub fn take_request(&mut self, stream: &mut store::Ptr) -> Request<()> {
+    pub fn take_request(&mut self, stream: &mut store::PtrMut) -> Request<()> {
         use super::peer::PollMessage::*;
 
-        match stream.ref_mut().pending_recv.pop_front(&mut self.buffer) {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
             Some(Event::Headers(Server(request))) => request,
             _ => unreachable!("server stream queue must start with Headers"),
         }
@@ -290,27 +289,28 @@ impl Recv {
     pub fn poll_pushed(
         &mut self,
         cx: &Context,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) -> Poll<Option<Result<(Request<()>, store::Key), proto::Error>>> {
         use super::peer::PollMessage::*;
 
-        let mut ppp = stream.ref_mut().pending_push_promises.take();
-        let pushed = ppp.pop(stream.store_mut()).map(|mut pushed| {
-            match pushed.ref_mut().pending_recv.pop_front(&mut self.buffer) {
+        let mut ppp = stream.pending_push_promises.take();
+        let pushed = ppp.pop(stream.store_mut()).map(|ptr| {
+            let mut pushed = ptr.lock();
+            match pushed.pending_recv.pop_front(&mut self.buffer) {
                 Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
                 // When frames are pushed into the queue, it is verified that
                 // the first frame is a HEADERS frame.
                 _ => panic!("Headers not set on pushed stream"),
             }
         });
-        stream.ref_mut().pending_push_promises = ppp;
+        stream.pending_push_promises = ppp;
         if let Some(p) = pushed {
             Poll::Ready(Some(Ok(p)))
         } else {
-            let is_open = stream.borrow().state.ensure_recv_open()?;
+            let is_open = stream.state.ensure_recv_open()?;
 
             if is_open {
-                stream.ref_mut().push_task = Some(cx.waker().clone());
+                stream.push_task = Some(cx.waker().clone());
                 Poll::Pending
             } else {
                 Poll::Ready(None)
@@ -322,25 +322,25 @@ impl Recv {
     pub fn poll_response(
         &mut self,
         cx: &Context,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) -> Poll<Result<Response<()>, proto::Error>> {
         use super::peer::PollMessage::*;
 
         // If the buffer is not empty, then the first frame must be a HEADERS
         // frame or the user violated the contract.
-        match stream.ref_mut().pending_recv.pop_front(&mut self.buffer) {
+        match stream.pending_recv.pop_front(&mut self.buffer) {
             Some(Event::Headers(Client(response))) => Poll::Ready(Ok(response)),
             Some(_) => panic!("poll_response called after response returned"),
             None => {
-                if !stream.borrow().state.ensure_recv_open()? {
-                    proto_err!(stream: "poll_response: stream={:?} is not opened;",  stream.borrow().id);
+                if !stream.state.ensure_recv_open()? {
+                    proto_err!(stream: "poll_response: stream={:?} is not opened;",  stream.id);
                     return Poll::Ready(Err(Error::library_reset(
-                        stream.borrow().id,
+                        stream.id,
                         Reason::PROTOCOL_ERROR,
                     )));
                 }
 
-                stream.ref_mut().recv_task = Some(cx.waker().clone());
+                stream.recv_task = Some(cx.waker().clone());
                 Poll::Pending
             }
         }
@@ -350,24 +350,23 @@ impl Recv {
     pub fn recv_trailers(
         &mut self,
         frame: frame::Headers,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) -> Result<(), Error> {
         // Transition the state
-        stream.ref_mut().state.recv_close()?;
+        stream.state.recv_close()?;
 
-        if stream.borrow().ensure_content_length_zero().is_err() {
-            proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.borrow().id);
-            return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR));
+        if stream.ensure_content_length_zero().is_err() {
+            proto_err!(stream: "recv_trailers: content-length is not zero; stream={:?};",  stream.id);
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
         let trailers = frame.into_fields();
 
         // Push the frame onto the stream's recv buffer
         stream
-            .ref_mut()
             .pending_recv
             .push_back(&mut self.buffer, Event::Trailers(trailers));
-        stream.ref_mut().notify_recv();
+        stream.notify_recv();
 
         Ok(())
     }
@@ -399,26 +398,26 @@ impl Recv {
     pub fn release_capacity(
         &mut self,
         capacity: WindowSize,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
         tracing::trace!("release_capacity; size={}", capacity);
 
-        if capacity > stream.borrow().in_flight_recv_data {
+        if capacity > stream.in_flight_recv_data {
             return Err(UserError::ReleaseCapacityTooBig);
         }
 
         self.release_connection_capacity(capacity, task);
 
         // Decrement in-flight data
-        stream.ref_mut().in_flight_recv_data -= capacity;
+        stream.in_flight_recv_data -= capacity;
 
         // Assign capacity to stream
         // TODO: proper error handling
-        let _res = stream.ref_mut().recv_flow.assign_capacity(capacity);
+        let _res = stream.recv_flow.assign_capacity(capacity);
         debug_assert!(_res.is_ok());
 
-        if stream.borrow().recv_flow.unclaimed_capacity().is_some() {
+        if stream.recv_flow.unclaimed_capacity().is_some() {
             // Queue the stream for sending the WINDOW_UPDATE frame.
             self.pending_window_updates.push(stream);
 
@@ -431,23 +430,23 @@ impl Recv {
     }
 
     /// Release any unclaimed capacity for a closed stream.
-    pub fn release_closed_capacity(&mut self, stream: &mut store::Ptr, task: &Mutex<Option<Waker>>) {
-        debug_assert_eq!(stream.borrow().ref_count, 0);
+    pub fn release_closed_capacity(&mut self, stream: &mut store::PtrMut, task: &Mutex<Option<Waker>>) {
+        debug_assert_eq!(stream.ref_count, 0);
 
-        if stream.borrow().in_flight_recv_data == 0 {
+        if stream.in_flight_recv_data == 0 {
             return;
         }
 
         tracing::trace!(
             "auto-release closed stream ({:?}) capacity: {:?}",
-            stream.borrow().id,
-            stream.borrow().in_flight_recv_data,
+            stream.id,
+            stream.in_flight_recv_data,
         );
 
-        self.release_connection_capacity(stream.borrow().in_flight_recv_data, task);
-        stream.ref_mut().in_flight_recv_data = 0;
+        self.release_connection_capacity(stream.in_flight_recv_data, task);
+        stream.in_flight_recv_data = 0;
 
-        self.clear_recv_buffer(stream.ref_mut());
+        self.clear_recv_buffer(stream);
     }
 
     /// Set the "target" connection window size.
@@ -538,9 +537,9 @@ impl Recv {
                     let dec = old_sz - target;
                     tracing::trace!("decrementing all windows; dec={}", dec);
 
-                    store.try_for_each(|mut stream| {
+                    store.try_for_each(|ptr| {
+                        let mut stream = ptr.lock();
                         stream
-                            .ref_mut()
                             .recv_flow
                             .dec_recv_window(dec)
                             .map_err(proto::Error::library_go_away)?;
@@ -551,16 +550,15 @@ impl Recv {
                     // We must increase the (local) window on every open stream.
                     let inc = target - old_sz;
                     tracing::trace!("incrementing all windows; inc={}", inc);
-                    store.try_for_each(|mut stream| {
+                    store.try_for_each(|ptr| {
+                        let mut stream = ptr.lock();
                         // XXX: Shouldn't the peer have already noticed our
                         // overflow and sent us a GOAWAY?
                         stream
-                            .ref_mut()
                             .recv_flow
                             .inc_window(inc)
                             .map_err(proto::Error::library_go_away)?;
                         stream
-                            .ref_mut()
                             .recv_flow
                             .assign_capacity(inc)
                             .map_err(proto::Error::library_go_away)?;
@@ -574,15 +572,15 @@ impl Recv {
         Ok(())
     }
 
-    pub fn is_end_stream(&self, stream: &store::Ptr) -> bool {
-        if !stream.borrow().state.is_recv_end_stream() {
+    pub fn is_end_stream(&self, stream: &store::PtrMut) -> bool {
+        if !stream.state.is_recv_end_stream() {
             return false;
         }
 
-        stream.borrow().pending_recv.is_empty()
+        stream.pending_recv.is_empty()
     }
 
-    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::Ptr) -> Result<(), Error> {
+    pub fn recv_data(&mut self, frame: frame::Data, stream: &mut store::PtrMut) -> Result<(), Error> {
         let sz = frame.payload().len();
 
         // This should have been enforced at the codec::FramedRead layer, so
@@ -591,15 +589,15 @@ impl Recv {
 
         let sz = sz as WindowSize;
 
-        let is_ignoring_frame = stream.borrow().state.is_local_error();
+        let is_ignoring_frame = stream.state.is_local_error();
 
-        if !is_ignoring_frame && !stream.borrow().state.is_recv_streaming() {
+        if !is_ignoring_frame && !stream.state.is_recv_streaming() {
             // TODO: There are cases where this can be a stream error of
             // STREAM_CLOSED instead...
 
             // Receiving a DATA frame when not expecting one is a protocol
             // error.
-            proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.borrow().id);
+            proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
             return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
@@ -607,13 +605,13 @@ impl Recv {
             "recv_data; size={}; connection={}; stream={}",
             sz,
             self.flow.window_size(),
-            stream.borrow().recv_flow.window_size()
+            stream.recv_flow.window_size()
         );
 
         if is_ignoring_frame {
             tracing::trace!(
                 "recv_data; frame ignored on locally reset {:?} for some time",
-                stream.borrow().id,
+                stream.id,
             );
             return self.ignore_data(sz);
         }
@@ -622,7 +620,7 @@ impl Recv {
         // on the stream.
         self.consume_connection_window(sz)?;
 
-        if stream.borrow().recv_flow.window_size() < sz {
+        if stream.recv_flow.window_size() < sz {
             // http://httpwg.org/specs/rfc7540.html#WINDOW_UPDATE
             // > A receiver MAY respond with a stream error (Section 5.4.2) or
             // > connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR if
@@ -631,39 +629,39 @@ impl Recv {
             // So, for violating the **stream** window, we can send either a
             // stream or connection error. We've opted to send a stream
             // error.
-            return Err(Error::library_reset(stream.borrow().id, Reason::FLOW_CONTROL_ERROR));
+            return Err(Error::library_reset(stream.id, Reason::FLOW_CONTROL_ERROR));
         }
 
-        if stream.ref_mut().dec_content_length(frame.payload().len()).is_err() {
+        if stream.dec_content_length(frame.payload().len()).is_err() {
             proto_err!(stream:
                 "recv_data: content-length overflow; stream={:?}; len={:?}",
-                stream.borrow().id,
+                stream.id,
                 frame.payload().len(),
             );
-            return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR));
+            return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
         }
 
         if frame.is_end_stream() {
-            if stream.ref_mut().ensure_content_length_zero().is_err() {
+            if stream.ensure_content_length_zero().is_err() {
                 proto_err!(stream:
                     "recv_data: content-length underflow; stream={:?}; len={:?}",
-                    stream.borrow().id,
+                    stream.id,
                     frame.payload().len(),
                 );
-                return Err(Error::library_reset(stream.borrow().id, Reason::PROTOCOL_ERROR));
+                return Err(Error::library_reset(stream.id, Reason::PROTOCOL_ERROR));
             }
 
-            if stream.ref_mut().state.recv_close().is_err() {
-                proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.borrow().id);
+            if stream.state.recv_close().is_err() {
+                proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
                 return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
             }
         }
 
         // Received a frame, but no one cared about it. fix issue#648
-        if !stream.borrow().is_recv {
+        if !stream.is_recv {
             tracing::trace!(
                 "recv_data; frame ignored on stream release {:?} for some time",
-                stream.borrow().id,
+                stream.id,
             );
             self.release_connection_capacity(sz, &Mutex::new(None));
             return Ok(());
@@ -671,19 +669,18 @@ impl Recv {
 
         // Update stream level flow control
         stream
-            .ref_mut()
             .recv_flow
             .send_data(sz)
             .map_err(proto::Error::library_go_away)?;
 
         // Track the data as in-flight
-        stream.ref_mut().in_flight_recv_data += sz;
+        stream.in_flight_recv_data += sz;
 
         let event = Event::Data(frame.into_payload());
 
         // Push the frame onto the recv buffer
-        stream.ref_mut().pending_recv.push_back(&mut self.buffer, event);
-        stream.ref_mut().notify_recv();
+        stream.pending_recv.push_back(&mut self.buffer, event);
+        stream.notify_recv();
 
         Ok(())
     }
@@ -725,9 +722,9 @@ impl Recv {
     pub fn recv_push_promise(
         &mut self,
         frame: frame::PushPromise,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) -> Result<(), Error> {
-        stream.ref_mut().state.reserve_remote()?;
+        stream.state.reserve_remote()?;
         if frame.is_over_size() {
             // A frame is over size if the decoded header block was bigger than
             // SETTINGS_MAX_HEADER_LIST_SIZE.
@@ -776,11 +773,10 @@ impl Recv {
 
         use super::peer::PollMessage::*;
         stream
-            .ref_mut()
             .pending_recv
             .push_back(&mut self.buffer, Event::Headers(Server(req)));
-        stream.ref_mut().notify_recv();
-        stream.ref_mut().notify_push();
+        stream.notify_recv();
+        stream.notify_push();
         Ok(())
     }
 
@@ -915,12 +911,12 @@ impl Recv {
     }
 
     /// Add a locally reset stream to queue to be eventually reaped.
-    pub fn enqueue_reset_expiration(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
-        if !stream.borrow().state.is_local_error() || stream.borrow().is_pending_reset_expiration() {
+    pub fn enqueue_reset_expiration(&mut self, stream: &mut store::PtrMut, counts: &mut Counts) {
+        if !stream.state.is_local_error() || stream.is_pending_reset_expiration() {
             return;
         }
 
-        tracing::trace!("enqueue_reset_expiration; {:?}", stream.borrow().id);
+        tracing::trace!("enqueue_reset_expiration; {:?}", stream.id);
 
         if counts.can_inc_num_reset_streams() {
             counts.inc_num_reset_streams();
@@ -957,13 +953,14 @@ impl Recv {
         if !self.pending_reset_expired.is_empty() {
             let now = Instant::now();
             let reset_duration = self.reset_duration;
-            while let Some(stream) = self.pending_reset_expired.pop_if(store, |stream| {
+            while let Some(ptr) = self.pending_reset_expired.pop_if(store, |stream| {
                 let reset_at = stream.reset_at.expect("reset_at must be set if in queue");
                 // rust-lang/rust#86470 tracks a bug in the standard library where `Instant`
                 // subtraction can panic (because, on some platforms, `Instant` isn't actually
                 // monotonic). We use a saturating operation to avoid this panic here.
                 now.saturating_duration_since(reset_at) > reset_duration
             }) {
+                let stream = ptr.lock();
                 counts.transition_after(stream, true);
             }
         }
@@ -984,22 +981,25 @@ impl Recv {
     }
 
     fn clear_stream_window_update_queue(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_window_updates.pop(store) {
+        while let Some(ptr) = self.pending_window_updates.pop(store) {
+            let stream = ptr.lock();
             counts.transition(stream, |_, stream| {
-                tracing::trace!("clear_stream_window_update_queue; stream={:?}", stream.borrow().id);
+                tracing::trace!("clear_stream_window_update_queue; stream={:?}", stream.id);
             })
         }
     }
 
     /// Called on EOF
     fn clear_all_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_reset_expired.pop(store) {
+        while let Some(ptr) = self.pending_reset_expired.pop(store) {
+            let stream = ptr.lock();
             counts.transition_after(stream, true);
         }
     }
 
     fn clear_all_pending_accept(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_accept.pop(store) {
+        while let Some(ptr) = self.pending_accept.pop(store) {
+            let stream = ptr.lock();
             counts.transition_after(stream, false);
         }
     }
@@ -1070,16 +1070,17 @@ impl Recv {
             ready!(dst.poll_ready(cx))?;
 
             // Get the next stream
-            let stream = match self.pending_window_updates.pop(store) {
-                Some(stream) => stream,
+            let ptr = match self.pending_window_updates.pop(store) {
+                Some(ptr) => ptr,
                 None => return Poll::Ready(Ok(())),
             };
+            let stream = ptr.lock();
 
             counts.transition(stream, |_, stream| {
-                tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.borrow().id);
-                debug_assert!(!stream.borrow().is_pending_window_update);
+                tracing::trace!("pending_window_updates -- pop; stream={:?}", stream.id);
+                debug_assert!(!stream.is_pending_window_update);
 
-                if !stream.borrow().state.is_recv_streaming() {
+                if !stream.state.is_recv_streaming() {
                     // No need to send window updates on the stream if the stream is
                     // no longer receiving data.
                     //
@@ -1090,9 +1091,9 @@ impl Recv {
                 }
 
                 // TODO: de-dup
-                if let Some(incr) = stream.borrow().recv_flow.unclaimed_capacity() {
+                if let Some(incr) = stream.recv_flow.unclaimed_capacity() {
                     // Create the WINDOW_UPDATE frame
-                    let frame = frame::WindowUpdate::new(stream.borrow().id, incr);
+                    let frame = frame::WindowUpdate::new(stream.id, incr);
 
                     // Buffer it
                     dst.buffer(frame.into())
@@ -1100,7 +1101,6 @@ impl Recv {
 
                     // Update flow control
                     stream
-                        .ref_mut()
                         .recv_flow
                         .inc_window(incr)
                         .expect("unexpected flow control state");

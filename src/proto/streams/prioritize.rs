@@ -114,20 +114,20 @@ impl Prioritize {
         &mut self,
         frame: Frame<B>,
         buffer: &Buffer<Frame<B>>,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
         task: &Mutex<Option<Waker>>,
     ) {
-        let span = tracing::trace_span!("Prioritize::queue_frame", stream.id = ?stream.borrow().id);
+        let span = tracing::trace_span!("Prioritize::queue_frame", ?stream.id);
         let _e = span.enter();
         // Queue the frame in the buffer
-        stream.ref_mut().pending_send.push_back(buffer, frame);
+        stream.pending_send.push_back(buffer, frame);
         self.schedule_send(stream, task);
     }
 
-    pub fn schedule_send(&mut self, stream: &mut store::Ptr, task: &Mutex<Option<Waker>>) {
+    pub fn schedule_send(&mut self, stream: &mut store::PtrMut, task: &Mutex<Option<Waker>>) {
         // If the stream is waiting to be opened, nothing more to do.
-        if stream.borrow().is_send_ready() {
-            tracing::trace!(stream.id = ?stream.borrow().id, "schedule_send");
+        if stream.is_send_ready() {
+            tracing::trace!(?stream.id, "schedule_send");
             // Queue the stream
             self.pending_send.push(stream);
 
@@ -138,7 +138,7 @@ impl Prioritize {
         }
     }
 
-    pub fn queue_open(&mut self, stream: &mut store::Ptr) {
+    pub fn queue_open(&mut self, stream: &mut store::PtrMut) {
         self.pending_open.push(stream);
     }
 
@@ -147,7 +147,7 @@ impl Prioritize {
         &mut self,
         frame: frame::Data<B>,
         buffer: &Buffer<Frame<B>>,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError>
@@ -162,8 +162,8 @@ impl Prioritize {
 
         let sz = sz as WindowSize;
 
-        if !stream.borrow().state.is_send_streaming() {
-            if stream.borrow().state.is_closed() {
+        if !stream.state.is_send_streaming() {
+            if stream.state.is_closed() {
                 return Err(InactiveStreamId);
             } else {
                 return Err(UnexpectedFrameType);
@@ -171,19 +171,19 @@ impl Prioritize {
         }
 
         // Update the buffered data counter
-        stream.ref_mut().buffered_send_data += sz as usize;
+        stream.buffered_send_data += sz as usize;
 
         let span =
-            tracing::trace_span!("send_data", sz, requested = stream.borrow().requested_send_capacity);
+            tracing::trace_span!("send_data", sz, requested = stream.requested_send_capacity);
         let _e = span.enter();
-        tracing::trace!(buffered = stream.borrow().buffered_send_data);
+        tracing::trace!(buffered = stream.buffered_send_data);
 
         // Implicitly request more send capacity if not enough has been
         // requested yet.
-        if (stream.borrow().requested_send_capacity as usize) < stream.borrow().buffered_send_data {
+        if (stream.requested_send_capacity as usize) < stream.buffered_send_data {
             // Update the target requested capacity
-            stream.ref_mut().requested_send_capacity =
-                cmp::min(stream.borrow().buffered_send_data, WindowSize::MAX as usize) as WindowSize;
+            stream.requested_send_capacity =
+                cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
 
             // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
             // cannot be assigned at the time it is called.
@@ -191,19 +191,19 @@ impl Prioritize {
             // Streams over the max concurrent count will still call `send_data` so we should be
             // careful not to put it into `pending_capacity` as it will starve the connection
             // capacity for other streams
-            if !stream.borrow().is_pending_open {
+            if !stream.is_pending_open {
                 self.try_assign_capacity(stream);
             }
         }
 
         if frame.is_end_stream() {
-            stream.ref_mut().state.send_close();
+            stream.state.send_close();
             self.reserve_capacity(0, stream, counts);
         }
 
         tracing::trace!(
-            available = %stream.borrow().send_flow.available(),
-            buffered = stream.borrow().buffered_send_data,
+            available = %stream.send_flow.available(),
+            buffered = stream.buffered_send_data,
         );
 
         // The `stream.buffered_send_data == 0` check is here so that, if a zero
@@ -214,7 +214,7 @@ impl Prioritize {
         // Sending out zero length data frames can be done to signal
         // end-of-stream.
         //
-        if stream.borrow().send_flow.available() > 0 || stream.borrow().buffered_send_data == 0 {
+        if stream.send_flow.available() > 0 || stream.buffered_send_data == 0 {
             // The stream currently has capacity to send the data frame, so
             // queue it up and notify the connection task.
             self.queue_frame(frame.into(), buffer, stream, task);
@@ -222,7 +222,7 @@ impl Prioritize {
             // The stream has no capacity to send the frame now, save it but
             // don't notify the connection task. Once additional capacity
             // becomes available, the frame will be flushed.
-            stream.ref_mut().pending_send.push_back(buffer, frame.into());
+            stream.pending_send.push_back(buffer, frame.into());
         }
 
         Ok(())
@@ -232,32 +232,32 @@ impl Prioritize {
     pub fn reserve_capacity(
         &mut self,
         capacity: WindowSize,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
         counts: &mut Counts,
     ) {
         let span = tracing::trace_span!(
             "reserve_capacity",
-            stream.id = ?stream.borrow().id,
+            ?stream.id,
             requested = capacity,
-            effective = (capacity as usize) + stream.borrow().buffered_send_data,
-            curr = stream.borrow().requested_send_capacity
+            effective = (capacity as usize) + stream.buffered_send_data,
+            curr = stream.requested_send_capacity
         );
         let _e = span.enter();
 
         // Actual capacity is `capacity` + the current amount of buffered data.
         // If it were less, then we could never send out the buffered data.
-        let capacity = (capacity as usize) + stream.borrow().buffered_send_data;
+        let capacity = (capacity as usize) + stream.buffered_send_data;
 
-        match capacity.cmp(&(stream.borrow().requested_send_capacity as usize)) {
+        match capacity.cmp(&(stream.requested_send_capacity as usize)) {
             Ordering::Equal => {
                 // Nothing to do
             }
             Ordering::Less => {
                 // Update the target requested capacity
-                stream.ref_mut().requested_send_capacity = capacity as WindowSize;
+                stream.requested_send_capacity = capacity as WindowSize;
 
                 // Currently available capacity assigned to the stream
-                let available = stream.borrow().send_flow.available().as_size();
+                let available = stream.send_flow.available().as_size();
 
                 // If the stream has more assigned capacity than requested, reclaim
                 // some for the connection
@@ -265,7 +265,7 @@ impl Prioritize {
                     let diff = available - capacity as WindowSize;
 
                     // TODO: proper error handling
-                    let _res = stream.ref_mut().send_flow.claim_capacity(diff);
+                    let _res = stream.send_flow.claim_capacity(diff);
                     debug_assert!(_res.is_ok());
 
                     self.assign_connection_capacity(diff, stream.store_mut(), counts);
@@ -274,12 +274,12 @@ impl Prioritize {
             Ordering::Greater => {
                 // If trying to *add* capacity, but the stream send side is closed,
                 // there's nothing to be done.
-                if stream.borrow().state.is_send_closed() {
+                if stream.state.is_send_closed() {
                     return;
                 }
 
                 // Update the target requested capacity
-                stream.ref_mut().requested_send_capacity =
+                stream.requested_send_capacity =
                     cmp::min(capacity, WindowSize::MAX as usize) as WindowSize;
 
                 // Try to assign additional capacity to the stream. If none is
@@ -293,24 +293,24 @@ impl Prioritize {
     pub fn recv_stream_window_update(
         &mut self,
         inc: WindowSize,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) -> Result<(), Reason> {
         let span = tracing::trace_span!(
             "recv_stream_window_update",
-            stream.id = ?stream.borrow().id,
-            stream.state = ?stream.borrow().state,
+            ?stream.id,
+            ?stream.state,
             inc,
-            flow = ?stream.borrow().send_flow
+            flow = ?stream.send_flow
         );
         let _e = span.enter();
 
-        if stream.borrow().state.is_send_closed() && stream.borrow().buffered_send_data == 0 {
+        if stream.state.is_send_closed() && stream.buffered_send_data == 0 {
             // We can't send any data, so don't bother doing anything else.
             return Ok(());
         }
 
         // Update the stream level flow control.
-        stream.ref_mut().send_flow.inc_window(inc)?;
+        stream.send_flow.inc_window(inc)?;
 
         // If the stream is waiting on additional capacity, then this will
         // assign it (if available on the connection) and notify the producer
@@ -334,11 +334,11 @@ impl Prioritize {
 
     /// Reclaim all capacity assigned to the stream and re-assign it to the
     /// connection
-    pub fn reclaim_all_capacity(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
-        let available = stream.borrow().send_flow.available().as_size();
+    pub fn reclaim_all_capacity(&mut self, stream: &mut store::PtrMut, counts: &mut Counts) {
+        let available = stream.send_flow.available().as_size();
         if available > 0 {
             // TODO: proper error handling
-            let _res = stream.ref_mut().send_flow.claim_capacity(available);
+            let _res = stream.send_flow.claim_capacity(available);
             debug_assert!(_res.is_ok());
             // Re-assign all capacity to the connection
             self.assign_connection_capacity(available, stream.store_mut(), counts);
@@ -347,16 +347,15 @@ impl Prioritize {
 
     /// Reclaim just reserved capacity, not buffered capacity, and re-assign
     /// it to the connection
-    pub fn reclaim_reserved_capacity(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
+    pub fn reclaim_reserved_capacity(&mut self, stream: &mut store::PtrMut, counts: &mut Counts) {
         // only reclaim reserved capacity that isn't already buffered
-        if stream.borrow().send_flow.available().as_size() as usize > stream.borrow().buffered_send_data {
+        if stream.send_flow.available().as_size() as usize > stream.buffered_send_data {
             let reserved =
-                stream.borrow().send_flow.available().as_size() - stream.borrow().buffered_send_data as WindowSize;
+                stream.send_flow.available().as_size() - stream.buffered_send_data as WindowSize;
 
             // Panic safety: due to how `reserved` is computed it can't be greater
             // than what's available.
             stream
-                .ref_mut()
                 .send_flow
                 .claim_capacity(reserved)
                 .expect("window size should be greater than reserved");
@@ -368,9 +367,10 @@ impl Prioritize {
     pub fn clear_pending_capacity(&mut self, store: &mut Store, counts: &mut Counts) {
         let span = tracing::trace_span!("clear_pending_capacity");
         let _e = span.enter();
-        while let Some(stream) = self.pending_capacity.pop(store) {
+        while let Some(ptr) = self.pending_capacity.pop(store) {
+            let stream = ptr.lock();
             counts.transition(stream, |_, stream| {
-                tracing::trace!(stream.id = ?stream.borrow().id, "clear_pending_capacity");
+                tracing::trace!(?stream.id, "clear_pending_capacity");
             })
         }
     }
@@ -378,7 +378,7 @@ impl Prioritize {
     pub fn assign_connection_capacity(
         &mut self,
         inc: WindowSize,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
     )
     {
@@ -391,16 +391,17 @@ impl Prioritize {
 
         // Assign newly acquired capacity to streams pending capacity.
         while self.flow.available() > 0 {
-            let stream = match self.pending_capacity.pop(store) {
-                Some(stream) => stream,
+            let ptr = match self.pending_capacity.pop(store) {
+                Some(ptr) => ptr,
                 None => return,
             };
+            let stream = ptr.lock();
 
             // Streams pending capacity may have been reset before capacity
             // became available. In that case, the stream won't want any
             // capacity, and so we shouldn't "transition" on it, but just evict
             // it and continue the loop.
-            if !(stream.borrow().state.is_send_streaming() || stream.borrow().buffered_send_data > 0) {
+            if !(stream.state.is_send_streaming() || stream.buffered_send_data > 0) {
                 continue;
             }
 
@@ -414,27 +415,27 @@ impl Prioritize {
     }
 
     /// Request capacity to send data
-    fn try_assign_capacity(&mut self, stream: &mut store::Ptr) {
-        let total_requested = stream.borrow().requested_send_capacity;
+    fn try_assign_capacity(&mut self, stream: &mut store::PtrMut) {
+        let total_requested = stream.requested_send_capacity;
 
         // Total requested should never go below actual assigned
         // (Note: the window size can go lower than assigned)
-        debug_assert!(stream.borrow().send_flow.available() <= total_requested as usize);
+        debug_assert!(stream.send_flow.available() <= total_requested as usize);
 
         // The amount of additional capacity that the stream requests.
         // Don't assign more than the window has available!
         let additional = cmp::min(
-            total_requested - stream.borrow().send_flow.available().as_size(),
+            total_requested - stream.send_flow.available().as_size(),
             // Can't assign more than what is available
-            stream.borrow().send_flow.window_size() - stream.borrow().send_flow.available().as_size(),
+            stream.send_flow.window_size() - stream.send_flow.available().as_size(),
         );
-        let span = tracing::trace_span!("try_assign_capacity", stream.id = ?stream.borrow().id);
+        let span = tracing::trace_span!("try_assign_capacity", ?stream.id);
         let _e = span.enter();
         tracing::trace!(
             requested = total_requested,
             additional,
-            buffered = stream.borrow().buffered_send_data,
-            window = stream.borrow().send_flow.window_size(),
+            buffered = stream.buffered_send_data,
+            window = stream.send_flow.window_size(),
             conn = %self.flow.available()
         );
 
@@ -447,9 +448,9 @@ impl Prioritize {
         // streaming state (more data could be sent) or there is buffered data
         // waiting to be sent.
         debug_assert!(
-            stream.borrow().state.is_send_streaming() || stream.borrow().buffered_send_data > 0,
+            stream.state.is_send_streaming() || stream.buffered_send_data > 0,
             "state={:?}",
-            stream.borrow().state
+            stream.state
         );
 
         // The amount of currently available capacity on the connection
@@ -464,7 +465,7 @@ impl Prioritize {
             tracing::trace!(capacity = assign, "assigning");
 
             // Assign the capacity to the stream
-            stream.ref_mut().assign_capacity(assign, self.max_buffer_size);
+            stream.assign_capacity(assign, self.max_buffer_size);
 
             // Claim the capacity from the connection
             // TODO: proper error handling
@@ -473,14 +474,14 @@ impl Prioritize {
         }
 
         tracing::trace!(
-            available = %stream.borrow().send_flow.available(),
-            requested = stream.borrow().requested_send_capacity,
-            buffered = stream.borrow().buffered_send_data,
-            has_unavailable = %stream.borrow().send_flow.has_unavailable()
+            available = %stream.send_flow.available(),
+            requested = stream.requested_send_capacity,
+            buffered = stream.buffered_send_data,
+            has_unavailable = %stream.send_flow.has_unavailable()
         );
 
-        if stream.borrow().send_flow.available() < stream.borrow().requested_send_capacity as usize
-            && stream.borrow().send_flow.has_unavailable()
+        if stream.send_flow.available() < stream.requested_send_capacity as usize
+            && stream.send_flow.has_unavailable()
         {
             // The stream requires additional capacity and the stream's
             // window has available capacity, but the connection window
@@ -493,7 +494,7 @@ impl Prioritize {
 
         // If data is buffered and the stream is send ready, then
         // schedule the stream for execution
-        if stream.borrow().buffered_send_data > 0 && stream.borrow().is_send_ready() {
+        if stream.buffered_send_data > 0 && stream.is_send_ready() {
             // TODO: This assertion isn't *exactly* correct. There can still be
             // buffered send data while the stream's pending send queue is
             // empty. This can happen when a large data frame is in the process
@@ -534,7 +535,8 @@ impl Prioritize {
         tracing::trace!("poll_complete");
 
         loop {
-            if let Some(mut stream) = self.pop_pending_open(store, counts) {
+            if let Some(ptr) = self.pop_pending_open(store, counts) {
+                let mut stream = ptr.lock();
                 self.pending_send.push_front(&mut stream);
                 self.try_assign_capacity(&mut stream);
             }
@@ -634,7 +636,8 @@ impl Prioritize {
         });
 
         if frame.payload().has_remaining() {
-            let mut stream = store.resolve(key);
+            let ptr = store.resolve(key);
+            let mut stream = ptr.lock();
 
             if eos {
                 frame.set_end_stream(true);
@@ -654,29 +657,29 @@ impl Prioritize {
         &mut self,
         frame: Frame<B>,
         buffer: &Buffer<Frame<B>>,
-        stream: &mut store::Ptr,
+        stream: &mut store::PtrMut,
     ) {
         // Push the frame to the front of the stream's deque
-        stream.ref_mut().pending_send.push_front(buffer, frame);
+        stream.pending_send.push_front(buffer, frame);
 
         // If needed, schedule the sender
-        if stream.borrow().send_flow.available() > 0 {
-            debug_assert!(!stream.borrow().pending_send.is_empty());
+        if stream.send_flow.available() > 0 {
+            debug_assert!(!stream.pending_send.is_empty());
             self.pending_send.push(stream);
         }
     }
 
-    pub fn clear_queue<B>(&mut self, buffer: &Buffer<Frame<B>>, stream: &mut store::Ptr) {
-        let span = tracing::trace_span!("clear_queue", stream.id = ?stream.borrow().id);
+    pub fn clear_queue<B>(&mut self, buffer: &Buffer<Frame<B>>, stream: &mut store::PtrMut) {
+        let span = tracing::trace_span!("clear_queue", ?stream.id);
         let _e = span.enter();
 
         // TODO: make this more efficient?
-        while let Some(frame) = stream.ref_mut().pending_send.pop_front(buffer) {
+        while let Some(frame) = stream.pending_send.pop_front(buffer) {
             tracing::trace!(?frame, "dropping");
         }
 
-        stream.ref_mut().buffered_send_data = 0;
-        stream.ref_mut().requested_send_capacity = 0;
+        stream.buffered_send_data = 0;
+        stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
             if stream.key() == key {
                 // This stream could get cleaned up now - don't allow the buffered frame to get reclaimed.
@@ -686,18 +689,20 @@ impl Prioritize {
     }
 
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(mut stream) = self.pending_send.pop(store) {
-            let is_pending_reset = stream.borrow().is_pending_reset_expiration();
-            if let Some(reason) = stream.borrow().state.get_scheduled_reset() {
-                stream.ref_mut().set_reset(reason, Initiator::Library);
+        while let Some(ptr) = self.pending_send.pop(store) {
+            let mut stream = ptr.lock();
+            let is_pending_reset = stream.is_pending_reset_expiration();
+            if let Some(reason) = stream.state.get_scheduled_reset() {
+                stream.set_reset(reason, Initiator::Library);
             }
             counts.transition_after(stream, is_pending_reset);
         }
     }
 
     pub fn clear_pending_open(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_open.pop(store) {
-            let is_pending_reset = stream.borrow().is_pending_reset_expiration();
+        while let Some(ptr) = self.pending_open.pop(store) {
+            let stream = ptr.lock();
+            let is_pending_reset = stream.is_pending_reset_expiration();
             counts.transition_after(stream, is_pending_reset);
         }
     }
@@ -717,8 +722,9 @@ impl Prioritize {
 
         loop {
             match self.pending_send.pop(store) {
-                Some(mut stream) => {
-                    let span = tracing::trace_span!("popped", stream.id = ?stream.borrow().id, stream.state = ?stream.borrow().state);
+                Some(ptr) => {
+                    let mut stream = ptr.lock();
+                    let span = tracing::trace_span!("popped", ?stream.id, ?stream.state);
                     let _e = span.enter();
 
                     // It's possible that this stream, besides having data to send,
@@ -726,24 +732,24 @@ impl Prioritize {
                     // to wait for "some time" after a reset.
                     //
                     // To be safe, we just always ask the stream.
-                    let is_pending_reset = stream.borrow().is_pending_reset_expiration();
+                    let is_pending_reset = stream.is_pending_reset_expiration();
 
                     tracing::trace!(is_pending_reset);
 
-                    let frame = match stream.ref_mut().pending_send.pop_front(buffer) {
+                    let frame = match stream.pending_send.pop_front(buffer) {
                         Some(Frame::Data(mut frame)) => {
                             // Get the amount of capacity remaining for stream's
                             // window.
-                            let stream_capacity = stream.borrow().send_flow.available();
+                            let stream_capacity = stream.send_flow.available();
                             let sz = frame.payload().remaining();
 
                             tracing::trace!(
                                 sz,
                                 eos = frame.is_end_stream(),
                                 window = %stream_capacity,
-                                available = %stream.borrow().send_flow.available(),
-                                requested = stream.borrow().requested_send_capacity,
-                                buffered = stream.borrow().buffered_send_data,
+                                available = %stream.send_flow.available(),
+                                requested = stream.requested_send_capacity,
+                                buffered = stream.buffered_send_data,
                                 "data frame"
                             );
 
@@ -762,7 +768,7 @@ impl Prioritize {
                                 // happen if the remote reduced the stream
                                 // window. In this case, we need to buffer the
                                 // frame and wait for a window update...
-                                stream.ref_mut().pending_send.push_front(buffer, frame.into());
+                                stream.pending_send.push_front(buffer, frame.into());
 
                                 continue;
                             }
@@ -781,8 +787,8 @@ impl Prioritize {
                             // Check if the stream level window the peer knows is available. In some
                             // scenarios, maybe the window we know is available but the window which
                             // peer knows is not.
-                            if len > 0 && len > stream.borrow().send_flow.window_size() {
-                                stream.ref_mut().pending_send.push_front(buffer, frame.into());
+                            if len > 0 && len > stream.send_flow.window_size() {
+                                stream.pending_send.push_front(buffer, frame.into());
                                 continue;
                             }
 
@@ -790,7 +796,7 @@ impl Prioritize {
 
                             // Update the flow control
                             tracing::trace_span!("updating stream flow").in_scope(|| {
-                                stream.ref_mut().send_data(len, self.max_buffer_size);
+                                stream.send_data(len, self.max_buffer_size);
 
                                 // Assign the capacity back to the connection that
                                 // was just consumed from the stream in the previous
@@ -825,12 +831,13 @@ impl Prioritize {
                             }))
                         }
                         Some(Frame::PushPromise(pp)) => {
-                            let mut pushed =
-                                stream.store_mut().find_mut(&pp.promised_id()).unwrap();
-                            pushed.ref_mut().is_pending_push = false;
+                            let ptr =
+                                stream.store_mut().find(&pp.promised_id()).unwrap();
+                            let mut pushed = ptr.lock();
+                            pushed.is_pending_push = false;
                             // Transition stream from pending_push to pending_open
                             // if possible
-                            if !pushed.borrow().pending_send.is_empty() {
+                            if !pushed.pending_send.is_empty() {
                                 if counts.can_inc_num_send_streams() {
                                     counts.inc_num_send_streams(&mut pushed);
                                     self.pending_send.push(&mut pushed);
@@ -847,10 +854,10 @@ impl Prioritize {
                             )
                         }),
                         None => {
-                            if let Some(reason) = stream.borrow().state.get_scheduled_reset() {
-                                stream.ref_mut().set_reset(reason, Initiator::Library);
+                            if let Some(reason) = stream.state.get_scheduled_reset() {
+                                stream.set_reset(reason, Initiator::Library);
 
-                                let frame = frame::Reset::new(stream.borrow().id, reason);
+                                let frame = frame::Reset::new(stream.id, reason);
                                 Frame::Reset(frame)
                             } else {
                                 // If the stream receives a RESET from the peer, it may have
@@ -860,7 +867,7 @@ impl Prioritize {
                                 tracing::trace!("removing dangling stream from pending_send");
                                 // Since this should only happen as a consequence of `clear_queue`,
                                 // we must be in a closed state of some kind.
-                                debug_assert!(stream.borrow().state.is_closed());
+                                debug_assert!(stream.state.is_closed());
                                 counts.transition_after(stream, is_pending_reset);
                                 continue;
                             }
@@ -869,12 +876,12 @@ impl Prioritize {
 
                     tracing::trace!("pop_frame; frame={:?}", frame);
 
-                    if cfg!(debug_assertions) && stream.borrow().state.is_idle() {
-                        debug_assert!(stream.borrow().id > self.last_opened_id);
-                        self.last_opened_id = stream.borrow().id;
+                    if cfg!(debug_assertions) && stream.state.is_idle() {
+                        debug_assert!(stream.id > self.last_opened_id);
+                        self.last_opened_id = stream.id;
                     }
 
-                    if !stream.borrow().pending_send.is_empty() || stream.borrow().state.is_scheduled_reset() {
+                    if !stream.pending_send.is_empty() || stream.state.is_scheduled_reset() {
                         // TODO: Only requeue the sender IF it is ready to send
                         // the next frame. i.e. don't requeue it if the next
                         // frame is a data frame and the stream does not have
@@ -899,12 +906,15 @@ impl Prioritize {
         tracing::trace!("schedule_pending_open");
         // check for any pending open streams
         if counts.can_inc_num_send_streams() {
-            if let Some(mut stream) = self.pending_open.pop(store) {
-                tracing::trace!("schedule_pending_open; stream={:?}", stream.borrow().id);
+            if let Some(ptr) = self.pending_open.pop(store) {
+                {
+                    let mut stream = ptr.lock();
+                    tracing::trace!("schedule_pending_open; stream={:?}", stream.id);
 
-                counts.inc_num_send_streams(&mut stream);
-                stream.ref_mut().notify_send();
-                return Some(stream);
+                    counts.inc_num_send_streams(&mut stream);
+                    stream.notify_send();
+                }
+                return Some(ptr);
             }
         }
 

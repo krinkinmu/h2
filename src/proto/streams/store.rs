@@ -7,18 +7,32 @@ use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+#[derive(Debug)]
+struct Inner {
+    slab: slab::Slab<Arc<Mutex<Stream>>>,
+    ids: IndexMap<StreamId, SlabIndex>,
+}
 
 /// Storage for streams
 #[derive(Debug)]
 pub(super) struct Store {
-    slab: slab::Slab<Stream>,
-    ids: IndexMap<StreamId, SlabIndex>,
+    inner: Mutex<Inner>,
 }
 
 /// "Pointer" to an entry in the store
 pub(super) struct Ptr<'a> {
     key: Key,
-    store: &'a mut Store,
+    store: &'a Store,
+    stream: Arc<Mutex<Stream>>,
+}
+
+pub(super) struct PtrMut<'a> {
+    key: Key,
+    store: &'a Store,
+    stream: MutexGuard<'a, Stream>,
 }
 
 /// References an entry in the store.
@@ -44,71 +58,86 @@ pub(super) trait Next {
 }
 
 pub(super) enum Entry<'a> {
-    Occupied(OccupiedEntry<'a>),
+    Occupied(OccupiedEntry),
     Vacant(VacantEntry<'a>),
 }
 
-pub(super) struct OccupiedEntry<'a> {
-    ids: indexmap::map::OccupiedEntry<'a, StreamId, SlabIndex>,
+pub(super) struct OccupiedEntry {
+    key: Key,
 }
 
 pub(super) struct VacantEntry<'a> {
-    ids: indexmap::map::VacantEntry<'a, StreamId, SlabIndex>,
-    slab: &'a mut slab::Slab<Stream>,
+    guard: MutexGuard<'a, Inner>,
+    stream_id: StreamId,
 }
 
 pub(super) trait Resolve {
-    fn resolve(&mut self, key: Key) -> Ptr;
+    fn resolve(&self, key: Key) -> Ptr;
 
-    fn store(&mut self) -> &mut Store;
+    fn store(&self) -> &Store;
 }
 
 // ===== impl Store =====
 
 impl Store {
     pub fn new() -> Self {
-        Store {
+        let inner = Inner {
             slab: slab::Slab::new(),
             ids: IndexMap::new(),
-        }
+        };
+        Store { inner: Mutex::new(inner) }
     }
 
-    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr> {
-        let index = match self.ids.get(id) {
+    pub fn find(&self, id: &StreamId) -> Option<Ptr<'_>> {
+        let inner = self.inner.lock().unwrap();
+        let index = match inner.ids.get(id) {
             Some(key) => *key,
             None => return None,
         };
+        let stream = inner.slab.get(index.0 as usize)
+            .unwrap_or_else(|| {
+                panic!("dangling store key for stream_id={:?}", id);
+            });
 
         Some(Ptr {
             key: Key {
                 index,
                 stream_id: *id,
             },
+            stream: stream.clone(),
             store: self,
         })
     }
 
-    pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr {
-        let index = SlabIndex(self.slab.insert(val) as u32);
-        assert!(self.ids.insert(id, index).is_none());
+    pub fn insert(&self, id: StreamId, val: Stream) -> Ptr<'_> {
+        let stream = Arc::new(Mutex::new(val));
+        let index = {
+            let mut inner = self.inner.lock().unwrap();
+            let index = SlabIndex(inner.slab.insert(stream.clone()) as u32);
+            assert!(inner.ids.insert(id, index).is_none());
+            index
+        };
         Ptr {
             key: Key {
                 index,
                 stream_id: id,
             },
+            stream: stream,
             store: self,
         }
     }
 
-    pub fn find_entry(&mut self, id: StreamId) -> Entry {
-        use self::indexmap::map::Entry::*;
-
-        match self.ids.entry(id) {
-            Occupied(e) => Entry::Occupied(OccupiedEntry { ids: e }),
-            Vacant(e) => Entry::Vacant(VacantEntry {
-                ids: e,
-                slab: &mut self.slab,
-            }),
+    pub fn find_entry(&self, id: StreamId) -> Entry {
+        let inner = self.inner.lock().unwrap();
+        if let Some(index) = inner.ids.get(&id).map(|index| *index) {
+            Entry::Occupied(OccupiedEntry {
+                key: Key { stream_id: id, index: index },
+            })
+        } else {
+            Entry::Vacant(VacantEntry {
+                guard: inner,
+                stream_id: id,
+            })
         }
     }
 
@@ -127,62 +156,75 @@ impl Store {
         }
     }
 
-    pub fn try_for_each<F, E>(&mut self, mut f: F) -> Result<(), E>
+    fn all_streams(&self) -> Vec<Ptr<'_>> {
+        let inner = self.inner.lock().unwrap();
+        let mut ptrs = Vec::with_capacity(inner.ids.len());
+
+        for (stream_id, index) in inner.ids.iter() {
+            ptrs.push(Ptr {
+                key: Key { index: *index, stream_id: *stream_id },
+                stream: inner.slab.get(index.0 as usize).unwrap().clone(),
+                store: self,
+            });
+        }
+
+        ptrs
+    }
+
+    pub fn try_for_each<F, E>(&self, mut f: F) -> Result<(), E>
     where
         F: FnMut(Ptr) -> Result<(), E>,
     {
-        let mut len = self.ids.len();
-        let mut i = 0;
+        let ptrs = self.all_streams();
 
-        while i < len {
-            // Get the key by index, this makes the borrow checker happy
-            let (stream_id, index) = {
-                let entry = self.ids.get_index(i).unwrap();
-                (*entry.0, *entry.1)
-            };
-
-            f(Ptr {
-                key: Key { index, stream_id },
-                store: self,
-            })?;
-
-            // TODO: This logic probably could be better...
-            let new_len = self.ids.len();
-
-            if new_len < len {
-                debug_assert!(new_len == len - 1);
-                len -= 1;
-            } else {
-                i += 1;
-            }
+        // all_streams takes a snapshort of streams available in the store
+        // and we then can iterate over them without holding a lock.
+        //
+        // Thus if for whatever reason the function f need to call into
+        // Store again it would not cause a deadlock.
+        for ptr in ptrs.into_iter() {
+            f(ptr)?;
         }
 
         Ok(())
     }
 
-    pub fn index(&self, key: Key) -> &Stream {
-        self.slab.get(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
+    pub fn index(&self, key: Key) -> Arc<Mutex<Stream>> {
+        let inner = self.inner.lock().unwrap();
+        inner.slab.get(key.index.0 as usize)
             .unwrap_or_else(|| {
                 panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
+            }).clone()
     }
 
-    pub fn index_mut(&mut self, key: Key) -> &mut Stream {
-        self.slab.get_mut(key.index.0 as usize)
-            .filter(|s| s.id == key.stream_id)
-            .unwrap_or_else(|| {
-                panic!("dangling store key for stream_id={:?}", key.stream_id);
-            })
+    pub fn remove(&self, key: Key) -> StreamId {
+        let mut inner = self.inner.lock().unwrap();
+
+        // The stream must have been unlinked before this point
+        debug_assert!(!inner.ids.contains_key(&key.stream_id));
+
+        _ = inner.slab.remove(key.index.0 as usize);
+        key.stream_id
+    }
+
+    pub fn unlink(&self, key: Key) {
+        let mut inner = self.inner.lock().unwrap();
+
+        inner.ids.swap_remove(&key.stream_id);
     }
 }
 
 impl Resolve for Store {
-    fn resolve(&mut self, key: Key) -> Ptr {
-        Ptr { key, store: self }
+    fn resolve(&self, key: Key) -> Ptr<'_> {
+        let inner = self.inner.lock().unwrap();
+        let stream = inner.slab.get(key.index.0 as usize)
+            .unwrap_or_else(|| {
+                panic!("dangling store key for stream_id={:?}", key.stream_id);
+            });
+        Ptr { key, store: self, stream: stream.clone() }
     }
 
-    fn store(&mut self) -> &mut Store {
+    fn store(&self) -> &Store {
         self
     }
 }
@@ -205,7 +247,8 @@ impl Drop for Store {
         use std::thread;
 
         if !thread::panicking() {
-            debug_assert!(self.slab.is_empty());
+            let inner = self.inner.lock().unwrap();
+            debug_assert!(inner.slab.is_empty());
         }
     }
 }
@@ -233,46 +276,48 @@ where
     /// Queue the stream.
     ///
     /// If the stream is already contained by the list, return `false`.
-    pub fn push(&mut self, stream: &mut store::Ptr) -> bool {
+    pub fn push(&mut self, stream: &mut store::PtrMut) -> bool {
         tracing::trace!("Queue::push_back");
 
-        if N::is_queued(stream.borrow()) {
+        if N::is_queued(stream) {
             tracing::trace!(" -> already queued");
             return false;
         }
 
-        N::set_queued(stream.ref_mut(), true);
-
-        self.queue.push_back(stream.key().stream_id);
+        N::set_queued(stream, true);
+        self.queue.push_back(stream.id);
         true
     }
 
     /// Queue the stream
     ///
     /// If the stream is already contained by the list, return `false`.
-    pub fn push_front(&mut self, stream: &mut store::Ptr) -> bool {
+    pub fn push_front(&mut self, stream: &mut store::PtrMut) -> bool {
         tracing::trace!("Queue::push_front");
 
-        if N::is_queued(stream.borrow()) {
+        if N::is_queued(stream) {
             tracing::trace!(" -> already queued");
             return false;
         }
 
-        N::set_queued(stream.ref_mut(), true);
-        self.queue.push_front(stream.key().stream_id);
+        N::set_queued(stream, true);
+        self.queue.push_front(stream.id);
         true
     }
 
-    pub fn pop<'a, R>(&mut self, resolve: &'a mut R) -> Option<store::Ptr<'a>>
+    pub fn pop<'a, R>(&mut self, resolve: &'a R) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
     {
         if let Some(stream_id) = self.queue.pop_front() {
             let store = resolve.store();
-            let mut stream = store.find_mut(&stream_id).unwrap();
-            debug_assert!(N::is_queued(stream.borrow()));
-            N::set_queued(stream.ref_mut(), false);
-            return Some(stream);
+            let ptr = store.find(&stream_id).unwrap();
+            {
+                let mut stream = ptr.lock();
+                debug_assert!(N::is_queued(&stream));
+                N::set_queued(&mut stream, false);
+            }
+            return Some(ptr);
         }
 
         None
@@ -282,17 +327,22 @@ where
         self.queue.is_empty()
     }
 
-    pub fn pop_if<'a, R, F>(&mut self, resolve: &'a mut R, f: F) -> Option<store::Ptr<'a>>
+    pub fn pop_if<'a, R, F>(&mut self, resolve: &'a R, f: F) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
         F: Fn(&Stream) -> bool,
     {
         if let Some(stream_id) = self.queue.front() {
             let store = resolve.store();
-            let stream = store.find_mut(stream_id).unwrap();
-            let should_pop = f(stream.borrow());
+            let ptr = store.find(stream_id).unwrap();
+            let mut stream = ptr.lock();
+            let should_pop = f(&stream);
             if should_pop {
-                return self.pop(resolve)
+                let _ = self.queue.pop_front();
+                debug_assert!(N::is_queued(&stream));
+                N::set_queued(&mut stream, false);
+                drop(stream);
+                return Some(ptr);
             }
         }
 
@@ -308,65 +358,82 @@ impl<'a> Ptr<'a> {
         self.key
     }
 
-    pub fn store_mut(&mut self) -> &mut Store {
+    pub fn lock(&self) -> PtrMut<'_> {
+        PtrMut {
+            key: self.key,
+            store: self.store,
+            stream: self.stream.lock().unwrap(),
+        }
+    }
+
+    pub fn stream(&self) -> Arc<Mutex<Stream>> {
+        self.stream.clone()
+    }
+}
+
+impl<'a> PtrMut<'a> {
+    pub fn key(&self) -> Key {
+        self.key
+    }
+
+    pub fn store_mut(&self) -> &Store {
         self.store
     }
 
-    /// Remove the stream from the store
     pub fn remove(self) -> StreamId {
-        // The stream must have been unlinked before this point
-        debug_assert!(!self.store.ids.contains_key(&self.key.stream_id));
-
-        let stream = self.store.slab.remove(self.key.index.0 as usize);
-        assert_eq!(stream.id, self.key.stream_id);
-        stream.id
+        self.store.remove(self.key)
     }
 
-    /// Remove the StreamId -> stream state association.
-    ///
-    /// This will effectively remove the stream as far as the H2 protocol is
-    /// concerned.
-    pub fn unlink(&mut self) {
-        let id = self.key.stream_id;
-        self.store.ids.swap_remove(&id);
+    pub fn unlink(&self) {
+        self.store.unlink(self.key);
     }
+}
 
-    pub fn borrow(&self) -> &Stream {
-        self.store.index(self.key)
+impl<'a> Deref for PtrMut<'a> {
+    type Target = Stream;
+
+    fn deref(&self) -> &'_ Self::Target {
+        &self.stream
     }
+}
 
-    pub fn ref_mut(&mut self) -> &mut Stream {
-        self.store.index_mut(self.key)
+impl<'a> DerefMut for PtrMut<'a> {
+    fn deref_mut(&mut self) -> &'_ mut Self::Target {
+        &mut self.stream
     }
 }
 
 impl<'a> fmt::Debug for Ptr<'a> {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        (*self.borrow()).fmt(fmt)
+        (*self.stream().lock().unwrap()).fmt(fmt)
+    }
+}
+
+impl<'a> fmt::Debug for PtrMut<'a> {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        (*self.stream).fmt(fmt)
     }
 }
 
 // ===== impl OccupiedEntry =====
 
-impl<'a> OccupiedEntry<'a> {
+impl OccupiedEntry {
     pub fn key(&self) -> Key {
-        let stream_id = *self.ids.key();
-        let index = *self.ids.get();
-        Key { index, stream_id }
+        self.key
     }
 }
 
 // ===== impl VacantEntry =====
 
 impl<'a> VacantEntry<'a> {
-    pub fn insert(self, value: Stream) -> Key {
+    pub fn insert(mut self, value: Stream) -> Key {
+        assert_eq!(self.stream_id, value.id);
+
         // Insert the value in the slab
-        let stream_id = value.id;
-        let index = SlabIndex(self.slab.insert(value) as u32);
+        let stream = Arc::new(Mutex::new(value));
+        let index = SlabIndex(self.guard.slab.insert(stream) as u32);
+        assert!(self.guard.ids.insert(self.stream_id, index).is_none());
 
-        // Insert the handle in the ID map
-        self.ids.insert(index);
-
-        Key { index, stream_id }
+        Key { index, stream_id: self.stream_id }
     }
 }
