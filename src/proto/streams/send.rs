@@ -1,6 +1,6 @@
 use super::{
     store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
-    StreamIdOverflow, WindowSize,
+    StreamIdOverflow, WindowSize, WrappedCounts
 };
 use crate::codec::UserError;
 use crate::frame::{self, Reason};
@@ -18,7 +18,7 @@ use std::task::{Context, Poll, Waker};
 #[derive(Debug)]
 pub(super) struct Send {
     /// Stream identifier to use for next initialized stream.
-    next_stream_id: Result<StreamId, StreamIdOverflow>,
+    next_stream_id: Mutex<Result<StreamId, StreamIdOverflow>>,
 
     /// Any streams with a higher ID are ignored.
     ///
@@ -27,18 +27,18 @@ pub(super) struct Send {
     /// > After sending a GOAWAY frame, the sender can discard frames for
     /// > streams initiated by the receiver with identifiers higher than
     /// > the identified last stream.
-    max_stream_id: StreamId,
+    max_stream_id: Mutex<StreamId>,
 
     /// Initial window size of locally initiated streams
-    init_window_sz: WindowSize,
+    init_window_sz: Mutex<WindowSize>,
 
     /// Prioritization layer
     prioritize: Prioritize,
 
-    is_push_enabled: bool,
+    is_push_enabled: Mutex<bool>,
 
     /// If extended connect protocol is enabled.
-    is_extended_connect_protocol_enabled: bool,
+    is_extended_connect_protocol_enabled: Mutex<bool>,
 }
 
 /// A value to detect which public API has called `poll_reset`.
@@ -52,29 +52,31 @@ impl Send {
     /// Create a new `Send`
     pub fn new(config: &Config) -> Self {
         Send {
-            init_window_sz: config.remote_init_window_sz,
-            max_stream_id: StreamId::MAX,
-            next_stream_id: Ok(config.local_next_stream_id),
+            init_window_sz: Mutex::new(config.remote_init_window_sz),
+            max_stream_id: Mutex::new(StreamId::MAX),
+            next_stream_id: Mutex::new(Ok(config.local_next_stream_id)),
             prioritize: Prioritize::new(config),
-            is_push_enabled: true,
-            is_extended_connect_protocol_enabled: false,
+            is_push_enabled: Mutex::new(true),
+            is_extended_connect_protocol_enabled: Mutex::new(false),
         }
     }
 
     /// Returns the initial send window size
     pub fn init_window_sz(&self) -> WindowSize {
-        self.init_window_sz
+        *self.init_window_sz.lock().unwrap()
     }
 
-    pub fn open(&mut self) -> Result<StreamId, UserError> {
-        let stream_id = self.ensure_next_stream_id()?;
-        self.next_stream_id = stream_id.next_id();
+    pub fn open(&self) -> Result<StreamId, UserError> {
+        let mut next_stream_id = self.next_stream_id.lock().unwrap();
+        let stream_id = Self::ensure_next_stream_id(&next_stream_id)?;
+        *next_stream_id = stream_id.next_id();
         Ok(stream_id)
     }
 
-    pub fn reserve_local(&mut self) -> Result<StreamId, UserError> {
-        let stream_id = self.ensure_next_stream_id()?;
-        self.next_stream_id = stream_id.next_id();
+    pub fn reserve_local(&self) -> Result<StreamId, UserError> {
+        let mut next_stream_id = self.next_stream_id.lock().unwrap();
+        let stream_id = Self::ensure_next_stream_id(&next_stream_id)?;
+        *next_stream_id = stream_id.next_id();
         Ok(stream_id)
     }
 
@@ -98,20 +100,20 @@ impl Send {
     }
 
     pub fn send_push_promise<B>(
-        &mut self,
+        &self,
         frame: frame::PushPromise,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError> {
-        if !self.is_push_enabled {
+        if !*self.is_push_enabled.lock().unwrap() {
             return Err(UserError::PeerDisabledServerPush);
         }
 
         tracing::trace!(
             "send_push_promise; frame={:?}; init_window={:?}",
             frame,
-            self.init_window_sz
+            self.init_window_sz.lock().unwrap()
         );
 
         Self::check_headers(frame.fields())?;
@@ -124,7 +126,7 @@ impl Send {
     }
 
     pub fn send_headers<B>(
-        &mut self,
+        &self,
         frame: frame::Headers,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
@@ -170,7 +172,7 @@ impl Send {
 
     /// Send an explicit RST_STREAM frame
     pub fn send_reset<B>(
-        &mut self,
+        &self,
         reason: Reason,
         initiator: Initiator,
         buffer: &Buffer<Frame<B>>,
@@ -235,7 +237,7 @@ impl Send {
     }
 
     pub fn schedule_implicit_reset(
-        &mut self,
+        &self,
         stream: &mut store::PtrMut,
         reason: Reason,
         counts: &mut Counts,
@@ -253,11 +255,11 @@ impl Send {
     }
 
     pub fn send_data<B>(
-        &mut self,
+        &self,
         frame: frame::Data<B>,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
-        counts: &mut Counts,
+        counts: &mut WrappedCounts,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), UserError>
     where
@@ -268,7 +270,7 @@ impl Send {
     }
 
     pub fn send_trailers<B>(
-        &mut self,
+        &self,
         frame: frame::Headers,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
@@ -287,13 +289,13 @@ impl Send {
             .queue_frame(frame.into(), buffer, stream, task);
 
         // Release any excess capacity
-        self.prioritize.reserve_capacity(0, stream, counts);
+        self.prioritize.reserve_capacity(0, stream, &mut WrappedCounts::Locked(counts));
 
         Ok(())
     }
 
     pub fn poll_complete<T, B>(
-        &mut self,
+        &self,
         cx: &mut Context,
         buffer: &Buffer<Frame<B>>,
         store: &Store,
@@ -310,16 +312,16 @@ impl Send {
 
     /// Request capacity to send data
     pub fn reserve_capacity(
-        &mut self,
+        &self,
         capacity: WindowSize,
         stream: &mut store::PtrMut,
-        counts: &mut Counts,
+        counts: &mut WrappedCounts,
     ) {
         self.prioritize.reserve_capacity(capacity, stream, counts)
     }
 
     pub fn poll_capacity(
-        &mut self,
+        &self,
         cx: &Context,
         stream: &mut store::PtrMut,
     ) -> Poll<Option<Result<WindowSize, UserError>>> {
@@ -358,7 +360,7 @@ impl Send {
     }
 
     pub fn recv_connection_window_update(
-        &mut self,
+        &self,
         frame: frame::WindowUpdate,
         store: &Store,
         counts: &mut Counts,
@@ -368,7 +370,7 @@ impl Send {
     }
 
     pub fn recv_stream_window_update<B>(
-        &mut self,
+        &self,
         sz: WindowSize,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
@@ -393,8 +395,9 @@ impl Send {
         Ok(())
     }
 
-    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
-        if last_stream_id > self.max_stream_id {
+    pub(super) fn recv_go_away(&self, last_stream_id: StreamId) -> Result<(), Error> {
+        let mut max_stream_id = self.max_stream_id.lock().unwrap();
+        if last_stream_id > *max_stream_id {
             // The remote endpoint sent a `GOAWAY` frame indicating a stream
             // that we never sent, or that we have already terminated on account
             // of previous `GOAWAY` frame. In either case, that is illegal.
@@ -404,17 +407,17 @@ impl Send {
             // connection.")
             proto_err!(conn:
                 "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
-                last_stream_id, self.max_stream_id,
+                last_stream_id, max_stream_id,
             );
             return Err(Error::library_go_away(Reason::PROTOCOL_ERROR));
         }
 
-        self.max_stream_id = last_stream_id;
+        *max_stream_id = last_stream_id;
         Ok(())
     }
 
     pub fn handle_error<B>(
-        &mut self,
+        &self,
         buffer: &Buffer<Frame<B>>,
         stream: &mut store::PtrMut,
         counts: &mut Counts,
@@ -425,7 +428,7 @@ impl Send {
     }
 
     pub fn apply_remote_settings<B>(
-        &mut self,
+        &self,
         settings: &frame::Settings,
         buffer: &Buffer<Frame<B>>,
         store: &Store,
@@ -433,7 +436,7 @@ impl Send {
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), Error> {
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
-            self.is_extended_connect_protocol_enabled = val;
+            *self.is_extended_connect_protocol_enabled.lock().unwrap() = val;
         }
 
         // Applies an update to the remote endpoint's initial window size.
@@ -454,8 +457,9 @@ impl Send {
         // flow-controlled frames until it receives WINDOW_UPDATE frames that
         // cause the flow-control window to become positive.
         if let Some(val) = settings.initial_window_size() {
-            let old_val = self.init_window_sz;
-            self.init_window_sz = val;
+            let mut init_window_sz = self.init_window_sz.lock().unwrap();
+            let old_val = *init_window_sz;
+            *init_window_sz = val;
 
             match val.cmp(&old_val) {
                 Ordering::Less => {
@@ -527,7 +531,7 @@ impl Send {
                     })?;
 
                     self.prioritize
-                        .assign_connection_capacity(total_reclaimed, store, counts);
+                        .assign_connection_capacity(total_reclaimed, store, &mut WrappedCounts::Locked(counts));
                 }
                 Ordering::Greater => {
                     let inc = val - old_val;
@@ -543,20 +547,21 @@ impl Send {
         }
 
         if let Some(val) = settings.is_push_enabled() {
-            self.is_push_enabled = val
+            *self.is_push_enabled.lock().unwrap() = val;
         }
 
         Ok(())
     }
 
-    pub fn clear_queues(&mut self, store: &Store, counts: &mut Counts) {
+    pub fn clear_queues(&self, store: &Store, counts: &mut Counts) {
         self.prioritize.clear_pending_capacity(store, counts);
         self.prioritize.clear_pending_send(store, counts);
         self.prioritize.clear_pending_open(store, counts);
     }
 
     pub fn ensure_not_idle(&self, id: StreamId) -> Result<(), Reason> {
-        if let Ok(next) = self.next_stream_id {
+        let next_stream_id = self.next_stream_id.lock().unwrap();
+        if let Ok(next) = *next_stream_id {
             if id >= next {
                 return Err(Reason::PROTOCOL_ERROR);
             }
@@ -566,13 +571,19 @@ impl Send {
         Ok(())
     }
 
-    pub fn ensure_next_stream_id(&self) -> Result<StreamId, UserError> {
-        self.next_stream_id
+    pub fn ensure_next_stream_id(stream_id: &Result<StreamId, StreamIdOverflow>) -> Result<StreamId, UserError> {
+        stream_id
             .map_err(|_| UserError::OverflowedStreamId)
     }
 
+    pub fn check_next_stream_id(&self) -> Result<StreamId, UserError> {
+        let next_stream_id = self.next_stream_id.lock().unwrap();
+        Self::ensure_next_stream_id(&next_stream_id)
+    }
+
     pub fn may_have_created_stream(&self, id: StreamId) -> bool {
-        if let Ok(next_id) = self.next_stream_id {
+        let next_stream_id = self.next_stream_id.lock().unwrap();
+        if let Ok(next_id) = *next_stream_id {
             // Peer::is_local_init should have been called beforehand
             debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated(),);
             id < next_id
@@ -581,17 +592,18 @@ impl Send {
         }
     }
 
-    pub(super) fn maybe_reset_next_stream_id(&mut self, id: StreamId) {
-        if let Ok(next_id) = self.next_stream_id {
+    pub(super) fn maybe_reset_next_stream_id(&self, id: StreamId) {
+        let mut next_stream_id = self.next_stream_id.lock().unwrap();
+        if let Ok(next_id) = *next_stream_id {
             // Peer::is_local_init should have been called beforehand
             debug_assert_eq!(id.is_server_initiated(), next_id.is_server_initiated());
             if id >= next_id {
-                self.next_stream_id = id.next_id();
+                *next_stream_id = id.next_id();
             }
         }
     }
 
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
-        self.is_extended_connect_protocol_enabled
+        *self.is_extended_connect_protocol_enabled.lock().unwrap()
     }
 }

@@ -1,5 +1,7 @@
 use super::*;
 
+use std::sync::Mutex;
+
 #[derive(Debug)]
 pub(super) struct Counts {
     /// Acting as a client or server. This allows us to track which values to
@@ -39,6 +41,11 @@ pub(super) struct Counts {
     /// Total number of locally reset streams due to protocol error across the
     /// lifetime of the connection.
     num_local_error_reset_streams: usize,
+}
+
+pub(super) enum WrappedCounts<'a> {
+    Locked(&'a mut Counts),
+    Unlocked(&'a Mutex<Counts>),
 }
 
 impl Counts {
@@ -185,6 +192,37 @@ impl Counts {
         }
     }
 
+    /// Returns the maximum number of streams that can be initiated by this
+    /// peer.
+    pub(crate) fn max_send_streams(&self) -> usize {
+        self.max_send_streams
+    }
+
+    /// Returns the maximum number of streams that can be initiated by the
+    /// remote peer.
+    pub(crate) fn max_recv_streams(&self) -> usize {
+        self.max_recv_streams
+    }
+
+    fn dec_num_streams(&mut self, stream: &mut store::PtrMut) {
+        assert!(stream.is_counted);
+
+        if self.peer.is_local_init(stream.id) {
+            assert!(self.num_send_streams > 0);
+            self.num_send_streams -= 1;
+            stream.is_counted = false;
+        } else {
+            assert!(self.num_recv_streams > 0);
+            self.num_recv_streams -= 1;
+            stream.is_counted = false;
+        }
+    }
+
+    fn dec_num_reset_streams(&mut self) {
+        assert!(self.num_local_reset_streams > 0);
+        self.num_local_reset_streams -= 1;
+    }
+
     /// Run a block of code that could potentially transition a stream's state.
     ///
     /// If the stream state transitions to closed, this function will perform
@@ -241,37 +279,6 @@ impl Counts {
             stream.remove();
         }
     }
-
-    /// Returns the maximum number of streams that can be initiated by this
-    /// peer.
-    pub(crate) fn max_send_streams(&self) -> usize {
-        self.max_send_streams
-    }
-
-    /// Returns the maximum number of streams that can be initiated by the
-    /// remote peer.
-    pub(crate) fn max_recv_streams(&self) -> usize {
-        self.max_recv_streams
-    }
-
-    fn dec_num_streams(&mut self, stream: &mut store::PtrMut) {
-        assert!(stream.is_counted);
-
-        if self.peer.is_local_init(stream.id) {
-            assert!(self.num_send_streams > 0);
-            self.num_send_streams -= 1;
-            stream.is_counted = false;
-        } else {
-            assert!(self.num_recv_streams > 0);
-            self.num_recv_streams -= 1;
-            stream.is_counted = false;
-        }
-    }
-
-    fn dec_num_reset_streams(&mut self) {
-        assert!(self.num_local_reset_streams > 0);
-        self.num_local_reset_streams -= 1;
-    }
 }
 
 impl Drop for Counts {
@@ -281,5 +288,61 @@ impl Drop for Counts {
         if !thread::panicking() {
             debug_assert!(!self.has_streams());
         }
+    }
+}
+
+impl<'a> WrappedCounts<'a> {
+    /// Run a block of code that could potentially transition a stream's state.
+    ///
+    /// If the stream state transitions to closed, this function will perform
+    /// all necessary cleanup.
+    ///
+    /// TODO: Is this function still needed?
+    pub fn transition<F, U>(&mut self, mut stream: store::PtrMut, f: F) -> U
+    where
+        F: FnOnce(&mut Self, &mut store::PtrMut) -> U,
+    {
+        // TODO: Does this need to be computed before performing the action?
+        let is_pending_reset = stream.is_pending_reset_expiration();
+
+        // Run the action
+        let ret = f(self, &mut stream);
+
+        self.transition_after(stream, is_pending_reset);
+
+        ret
+    }
+
+    // TODO: move this to macro?
+    pub fn transition_after(&mut self, mut stream: store::PtrMut, is_reset_counted: bool) {
+        match self {
+            WrappedCounts::Locked(counts) => {
+                counts.transition_after(stream, is_reset_counted);
+            },
+
+            WrappedCounts::Unlocked(mux) => {
+                if stream.is_closed() {
+                    let mut counts = mux.lock().unwrap();
+
+                    if !stream.is_pending_reset_expiration() {
+                        stream.unlink();
+                        if is_reset_counted {
+                            counts.dec_num_reset_streams();
+                        }
+                    }
+
+                    if !stream.state.is_scheduled_reset() && stream.is_counted {
+                        tracing::trace!("dec_num_streams; stream={:?}", stream.id);
+                        // Decrement the number of active streams.
+                        counts.dec_num_streams(&mut stream);
+                    }
+                }
+
+                // Release the stream if it requires releasing
+                if stream.is_released() {
+                    stream.remove();
+                }
+            },
+        };
     }
 }

@@ -1,6 +1,6 @@
 use super::recv::RecvHeaderBlockError;
 use super::store::{self, Entry, Resolve, Store};
-use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
+use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId, WrappedCounts};
 use crate::codec::{Codec, SendError, UserError};
 use crate::ext::Protocol;
 use crate::frame::{self, Frame, Reason};
@@ -257,7 +257,7 @@ where
         let mut counts = self.counts.lock().unwrap();
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        me.actions.send.check_next_stream_id()?;
 
         // The `pending` argument is provided by the `Client`, and holds
         // a store `Key` of a `Stream` that may have been not been opened
@@ -996,7 +996,7 @@ where
         let me = &mut *me;
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.ensure_next_stream_id()?;
+        me.actions.send.check_next_stream_id()?;
 
         if let Some(pending) = pending {
             let ptr = self.store.resolve(pending.key);
@@ -1113,13 +1113,11 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let mut counts = self.opaque.counts.lock().unwrap();
-
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
         let actions = &mut me.actions;
 
-        counts.transition(stream, |counts, stream| {
+        WrappedCounts::Unlocked(&self.opaque.counts).transition(stream, |counts, stream| {
             // Create the data frame
             let mut frame = frame::Data::new(stream.id, data);
             frame.set_end_stream(end_stream);
@@ -1283,7 +1281,7 @@ impl<B> StreamRef<B> {
 
         me.actions
             .send
-            .reserve_capacity(capacity, &mut stream, &mut counts)
+            .reserve_capacity(capacity, &mut stream, &mut WrappedCounts::Locked(&mut counts))
     }
 
     /// Returns the stream's current send capacity.
@@ -1513,13 +1511,12 @@ impl Clone for OpaqueStreamRef {
 
 impl Drop for OpaqueStreamRef {
     fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
-        drop_stream_ref(&self.inner, &self.store, &mut counts, self.key);
+        drop_stream_ref(&self.inner, &self.store, &self.counts, self.key);
     }
 }
 
 // TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &mut Counts, key: store::Key) {
+fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &Mutex<Counts>, key: store::Key) {
     let mut me = match inner.lock() {
         Ok(inner) => inner,
         Err(_) => {
@@ -1531,6 +1528,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &mut Counts, key
             }
         }
     };
+    let mut counts = counts.lock().unwrap();
 
     let me = &mut *me;
     me.refs -= 1;
