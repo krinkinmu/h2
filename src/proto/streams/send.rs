@@ -296,7 +296,7 @@ impl Send {
         &mut self,
         cx: &mut Context,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -360,7 +360,7 @@ impl Send {
     pub fn recv_connection_window_update(
         &mut self,
         frame: frame::WindowUpdate,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
     ) -> Result<(), Reason> {
         self.prioritize
@@ -428,7 +428,7 @@ impl Send {
         &mut self,
         settings: &frame::Settings,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
         task: &Mutex<Option<Waker>>,
     ) -> Result<(), Error> {
@@ -549,7 +549,7 @@ impl Send {
         Ok(())
     }
 
-    pub fn clear_queues(&mut self, store: &mut Store, counts: &mut Counts) {
+    pub fn clear_queues(&mut self, store: &Store, counts: &mut Counts) {
         self.prioritize.clear_pending_capacity(store, counts);
         self.prioritize.clear_pending_send(store, counts);
         self.prioritize.clear_pending_open(store, counts);

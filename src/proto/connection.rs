@@ -125,7 +125,7 @@ where
                 local_max_error_reset_streams: config.local_error_reset_streams_max,
             }
         }
-        let streams = Streams::new(streams_config(&config));
+        let streams = Streams::new(&streams_config(&config));
         Connection {
             codec,
             inner: ConnectionInner {

@@ -322,7 +322,7 @@ impl Prioritize {
     pub fn recv_connection_window_update(
         &mut self,
         inc: WindowSize,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
     ) -> Result<(), Reason> {
         // Update the connection's window
@@ -364,7 +364,7 @@ impl Prioritize {
         }
     }
 
-    pub fn clear_pending_capacity(&mut self, store: &mut Store, counts: &mut Counts) {
+    pub fn clear_pending_capacity(&mut self, store: &Store, counts: &mut Counts) {
         let span = tracing::trace_span!("clear_pending_capacity");
         let _e = span.enter();
         while let Some(ptr) = self.pending_capacity.pop(store) {
@@ -515,7 +515,7 @@ impl Prioritize {
         &mut self,
         cx: &mut Context,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -583,7 +583,7 @@ impl Prioritize {
     fn reclaim_frame<T, B>(
         &mut self,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> bool
     where
@@ -603,7 +603,7 @@ impl Prioritize {
     fn reclaim_frame_inner<B>(
         &mut self,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         frame: frame::Data<Prioritized<B>>,
     ) -> bool
     where
@@ -688,7 +688,7 @@ impl Prioritize {
         }
     }
 
-    pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
+    pub fn clear_pending_send(&mut self, store: &Store, counts: &mut Counts) {
         while let Some(ptr) = self.pending_send.pop(store) {
             let mut stream = ptr.lock();
             let is_pending_reset = stream.is_pending_reset_expiration();
@@ -699,7 +699,7 @@ impl Prioritize {
         }
     }
 
-    pub fn clear_pending_open(&mut self, store: &mut Store, counts: &mut Counts) {
+    pub fn clear_pending_open(&mut self, store: &Store, counts: &mut Counts) {
         while let Some(ptr) = self.pending_open.pop(store) {
             let stream = ptr.lock();
             let is_pending_reset = stream.is_pending_reset_expiration();
@@ -710,7 +710,7 @@ impl Prioritize {
     fn pop_frame<B>(
         &mut self,
         buffer: &Buffer<Frame<B>>,
-        store: &mut Store,
+        store: &Store,
         max_len: usize,
         counts: &mut Counts,
     ) -> Option<Frame<Prioritized<B>>>
@@ -900,7 +900,7 @@ impl Prioritize {
 
     fn pop_pending_open<'s>(
         &mut self,
-        store: &'s mut Store,
+        store: &'s Store,
         counts: &mut Counts,
     ) -> Option<store::Ptr<'s>> {
         tracing::trace!("schedule_pending_open");

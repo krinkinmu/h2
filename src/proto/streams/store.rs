@@ -142,7 +142,7 @@ impl Store {
     }
 
     #[allow(clippy::blocks_in_conditions)]
-    pub(crate) fn for_each<F>(&mut self, mut f: F)
+    pub(crate) fn for_each<F>(&self, mut f: F)
     where
         F: FnMut(Ptr),
     {

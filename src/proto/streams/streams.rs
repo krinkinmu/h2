@@ -34,6 +34,9 @@ where
     /// been shown to be necessary.
     send_buffer: Arc<SendBuffer<B>>,
 
+    /// Stores stream state
+    store: Arc<Store>,
+
     _p: ::std::marker::PhantomData<P>,
 }
 
@@ -44,6 +47,8 @@ pub(crate) struct DynStreams<'a, B> {
     inner: &'a Mutex<Inner>,
 
     send_buffer: &'a SendBuffer<B>,
+
+    store: &'a Store,
 
     peer: peer::Dyn,
 }
@@ -58,6 +63,7 @@ pub(crate) struct StreamRef<B> {
 /// Reference to the stream state that hides the send data chunk generic
 pub(crate) struct OpaqueStreamRef {
     inner: Arc<Mutex<Inner>>,
+    store: Arc<Store>,
     key: store::Key,
 }
 
@@ -72,9 +78,6 @@ struct Inner {
 
     /// Connection level state and performs actions on streams
     actions: Actions,
-
-    /// Stores stream state
-    store: Store,
 
     /// The number of stream refs to this shared state.
     refs: usize,
@@ -108,12 +111,13 @@ where
     B: Buf,
     P: Peer,
 {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: &Config) -> Self {
         let peer = P::r#dyn();
 
         Streams {
             inner: Inner::new(peer, config),
             send_buffer: Arc::new(SendBuffer::new()),
+            store: Arc::new(Store::new()),
             _p: ::std::marker::PhantomData,
         }
     }
@@ -130,8 +134,8 @@ where
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
-        me.actions.recv.next_incoming(&mut me.store).map(|key| {
-            let mut ptr = me.store.resolve(key);
+        me.actions.recv.next_incoming(&self.store).map(|key| {
+            let mut ptr = self.store.resolve(key);
             {
                 let stream = ptr.lock();
                 tracing::trace!(
@@ -150,7 +154,7 @@ where
             }
 
             StreamRef {
-                opaque: OpaqueStreamRef::new(self.inner.clone(), &mut ptr),
+                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), &mut ptr),
                 send_buffer: self.send_buffer.clone(),
             }
         })
@@ -174,7 +178,7 @@ where
         let me = &mut *me;
         me.actions
             .recv
-            .clear_expired_reset_streams(&mut me.store, &mut me.counts);
+            .clear_expired_reset_streams(&self.store, &mut me.counts);
     }
 
     pub fn poll_complete<T>(
@@ -186,7 +190,7 @@ where
         T: AsyncWrite + Unpin,
     {
         let mut me = self.inner.lock().unwrap();
-        me.poll_complete(&self.send_buffer, cx, dst)
+        me.poll_complete(&self.send_buffer, &self.store, cx, dst)
     }
 
     pub fn apply_remote_settings(
@@ -202,7 +206,7 @@ where
         me.actions.send.apply_remote_settings(
             frame,
             &self.send_buffer.inner,
-            &mut me.store,
+            &self.store,
             &mut me.counts,
             &me.actions.task,
         )
@@ -212,7 +216,7 @@ where
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        me.actions.recv.apply_local_settings(frame, &mut me.store)
+        me.actions.recv.apply_local_settings(frame, &self.store)
     }
 
     pub fn send_request(
@@ -247,7 +251,7 @@ where
         // If that stream is still pending, the Client isn't allowed to
         // queue up another pending stream. They should use `poll_ready`.
         if let Some(stream) = pending {
-            let ptr = me.store.resolve(stream.key);
+            let ptr = self.store.resolve(stream.key);
             let stream = ptr.lock();
             if stream.is_pending_open {
                 return Err(UserError::Rejected.into());
@@ -275,7 +279,7 @@ where
         let headers =
             client::Peer::convert_send_message(stream_id, request, protocol, end_of_stream)?;
 
-        let mut ptr = me.store.insert(stream.id, stream);
+        let mut ptr = self.store.insert(stream.id, stream);
         {
             let mut stream = ptr.lock();
 
@@ -307,7 +311,7 @@ where
         let is_full = me.counts.next_send_stream_will_reach_capacity();
         Ok((
             StreamRef {
-                opaque: OpaqueStreamRef::new(self.inner.clone(), &mut ptr),
+                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), &mut ptr),
                 send_buffer: self.send_buffer.clone(),
             },
             is_full,
@@ -346,29 +350,29 @@ impl<B> DynStreams<'_, B> {
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
 
-        me.recv_headers(self.peer, self.send_buffer, frame)
+        me.recv_headers(self.peer, self.send_buffer, self.store, frame)
     }
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
-        me.recv_data(self.peer, self.send_buffer, frame)
+        me.recv_data(self.peer, self.send_buffer, self.store, frame)
     }
 
     pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
 
-        me.recv_reset(self.send_buffer, frame)
+        me.recv_reset(self.send_buffer, self.store, frame)
     }
 
     /// Notify all streams that a connection-level error happened.
     pub fn handle_error(&mut self, err: proto::Error) -> StreamId {
         let mut me = self.inner.lock().unwrap();
-        me.handle_error(self.send_buffer, err)
+        me.handle_error(self.send_buffer, self.store, err)
     }
 
     pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
-        me.recv_go_away(self.send_buffer, frame)
+        me.recv_go_away(self.send_buffer, self.store, frame)
     }
 
     pub fn last_processed_id(&self) -> StreamId {
@@ -377,22 +381,22 @@ impl<B> DynStreams<'_, B> {
 
     pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
-        me.recv_window_update(self.send_buffer, frame)
+        me.recv_window_update(self.send_buffer, self.store, frame)
     }
 
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
-        me.recv_push_promise(self.send_buffer, frame)
+        me.recv_push_promise(self.send_buffer, self.store, frame)
     }
 
     pub fn recv_eof(&mut self, clear_pending_accept: bool) -> Result<(), ()> {
         let mut me = self.inner.lock().map_err(|_| ())?;
-        me.recv_eof(self.send_buffer, clear_pending_accept)
+        me.recv_eof(self.send_buffer, self.store, clear_pending_accept)
     }
 
     pub fn send_reset(&mut self, id: StreamId, reason: Reason) {
         let mut me = self.inner.lock().unwrap();
-        me.send_reset(self.send_buffer, id, reason)
+        me.send_reset(self.send_buffer, self.store, id, reason)
     }
 
     pub fn send_go_away(&mut self, last_processed_id: StreamId) {
@@ -402,7 +406,7 @@ impl<B> DynStreams<'_, B> {
 }
 
 impl Inner {
-    fn new(peer: peer::Dyn, config: Config) -> Arc<Mutex<Self>> {
+    fn new(peer: peer::Dyn, config: &Config) -> Arc<Mutex<Self>> {
         Arc::new(Mutex::new(Inner {
             counts: Counts::new(peer, &config),
             actions: Actions {
@@ -411,7 +415,6 @@ impl Inner {
                 task: Mutex::new(None),
                 conn_error: None,
             },
-            store: Store::new(),
             refs: 1,
         }))
     }
@@ -420,6 +423,7 @@ impl Inner {
         &mut self,
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: frame::Headers,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -435,7 +439,7 @@ impl Inner {
             return Ok(());
         }
 
-        let key = match self.store.find_entry(id) {
+        let key = match store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
                 // Client: it's possible to send a request, and then send
@@ -474,7 +478,7 @@ impl Inner {
             }
         };
 
-        let ptr = self.store.resolve(key);
+        let ptr = store.resolve(key);
         let stream = ptr.lock();
 
         if stream.state.is_local_error() {
@@ -538,11 +542,12 @@ impl Inner {
         &mut self,
         peer: peer::Dyn,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: frame::Data,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
 
-        let ptr = match self.store.find(&id) {
+        let ptr = match store.find(&id) {
             Some(ptr) => ptr,
             None => {
                 // The GOAWAY process has begun. All streams with a greater ID
@@ -597,6 +602,7 @@ impl Inner {
     fn recv_reset<B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: frame::Reset,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -617,7 +623,7 @@ impl Inner {
             return Ok(());
         }
 
-        let ptr = match self.store.find(&id) {
+        let ptr = match store.find(&id) {
             Some(ptr) => ptr,
             None => {
                 // TODO: Are there other error cases?
@@ -643,6 +649,7 @@ impl Inner {
     fn recv_window_update<B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: frame::WindowUpdate,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -650,12 +657,12 @@ impl Inner {
         if id.is_zero() {
             self.actions
                 .send
-                .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
+                .recv_connection_window_update(frame, store, &mut self.counts)
                 .map_err(Error::library_go_away)?;
         } else {
             // The remote may send window updates for streams that the local now
             // considers closed. It's ok...
-            if let Some(ptr) = self.store.find(&id) {
+            if let Some(ptr) = store.find(&id) {
                 let mut stream = ptr.lock();
                 // This result is ignored as there is nothing to do when there
                 // is an error. The stream is reset by the function on error and
@@ -677,13 +684,13 @@ impl Inner {
         Ok(())
     }
 
-    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: proto::Error) -> StreamId {
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, err: proto::Error) -> StreamId {
         let actions = &mut self.actions;
         let counts = &mut self.counts;
 
         let last_processed_id = actions.recv.last_processed_id();
 
-        self.store.for_each(|ptr| {
+        store.for_each(|ptr| {
             let stream = ptr.lock();
             counts.transition(stream, |counts, stream| {
                 actions.recv.handle_error(&err, stream);
@@ -699,6 +706,7 @@ impl Inner {
     fn recv_go_away<B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: &frame::GoAway,
     ) -> Result<(), Error> {
         let actions = &mut self.actions;
@@ -710,7 +718,7 @@ impl Inner {
 
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
 
-        self.store.for_each(|ptr| {
+        store.for_each(|ptr| {
             let stream = ptr.lock();
             if stream.id > last_stream_id {
                 counts.transition(stream, |counts, stream| {
@@ -728,13 +736,14 @@ impl Inner {
     fn recv_push_promise<B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         frame: frame::PushPromise,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
         let promised_id = frame.promised_id();
 
         // First, ensure that the initiating stream is still in a valid state.
-        let parent_key = match self.store.find(&id) {
+        let parent_key = match store.find(&id) {
             Some(ptr) => {
                 // The GOAWAY process has begun. All streams with a greater ID
                 // than specified as part of GOAWAY should be ignored.
@@ -788,7 +797,7 @@ impl Inner {
         // this requires a bit of indirection to make the borrow checker happy.
         let child_key: Option<store::Key> = {
             // Create state for the stream
-            let ptr = self.store.insert(promised_id, {
+            let ptr = store.insert(promised_id, {
                 Stream::new(
                     promised_id,
                     self.actions.send.init_window_sz(),
@@ -820,10 +829,10 @@ impl Inner {
 
         // If we're successful, push the headers and stream...
         if let Some(child_key) = child_key {
-            let parent_ptr = self.store.resolve(parent_key);
+            let parent_ptr = store.resolve(parent_key);
             let mut parent = parent_ptr.lock();
 
-            let child_ptr = self.store.resolve(child_key);
+            let child_ptr = store.resolve(child_key);
             let mut child = child_ptr.lock();
 
             parent.pending_push_promises.push(&mut child);
@@ -836,6 +845,7 @@ impl Inner {
     fn recv_eof<B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         clear_pending_accept: bool,
     ) -> Result<(), ()> {
         let actions = &mut self.actions;
@@ -853,7 +863,7 @@ impl Inner {
 
         tracing::trace!("Streams::recv_eof");
 
-        self.store.for_each(|ptr| {
+        store.for_each(|ptr| {
             let stream = ptr.lock();
             counts.transition(stream, |counts, stream| {
                 actions.recv.recv_eof(stream);
@@ -864,13 +874,14 @@ impl Inner {
             })
         });
 
-        actions.clear_queues(clear_pending_accept, &mut self.store, counts);
+        actions.clear_queues(clear_pending_accept, store, counts);
         Ok(())
     }
 
     fn poll_complete<T, B>(
         &mut self,
         send_buffer: &SendBuffer<B>,
+        store: &Store,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -885,13 +896,13 @@ impl Inner {
         ready!(self
             .actions
             .recv
-            .poll_complete(cx, &mut self.store, &mut self.counts, dst))?;
+            .poll_complete(cx, store, &mut self.counts, dst))?;
 
         // Send any other pending frames
         ready!(self.actions.send.poll_complete(
             cx,
             &send_buffer.inner,
-            &mut self.store,
+            store,
             &mut self.counts,
             dst
         ))?;
@@ -902,8 +913,8 @@ impl Inner {
         Poll::Ready(Ok(()))
     }
 
-    fn send_reset<B>(&mut self, send_buffer: &SendBuffer<B>, id: StreamId, reason: Reason) {
-        let key = match self.store.find_entry(id) {
+    fn send_reset<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, id: StreamId, reason: Reason) {
+        let key = match store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
                 // Resetting a stream we don't know about? That could be OK...
@@ -934,7 +945,7 @@ impl Inner {
             }
         };
 
-        let ptr = self.store.resolve(key);
+        let ptr = store.resolve(key);
         let stream = ptr.lock();
         self.actions.send_reset(
             stream,
@@ -962,7 +973,7 @@ where
         me.actions.send.ensure_next_stream_id()?;
 
         if let Some(pending) = pending {
-            let ptr = me.store.resolve(pending.key);
+            let ptr = self.store.resolve(pending.key);
             let mut stream = ptr.lock();
             tracing::trace!("poll_pending_open; stream = {:?}", stream.is_pending_open);
             if stream.is_pending_open {
@@ -982,11 +993,13 @@ where
         let Self {
             inner,
             send_buffer,
+            store,
             _p,
         } = self;
         DynStreams {
             inner,
             send_buffer,
+            store,
             peer: P::r#dyn(),
         }
     }
@@ -1039,6 +1052,7 @@ where
         Streams {
             inner: self.inner.clone(),
             send_buffer: self.send_buffer.clone(),
+            store: self.store.clone(),
             _p: ::std::marker::PhantomData,
         }
     }
@@ -1070,7 +1084,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
         let actions = &mut me.actions;
 
@@ -1090,7 +1104,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
         let actions = &mut me.actions;
 
@@ -1109,7 +1123,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
 
         me.actions
@@ -1126,7 +1140,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
         let actions = &mut me.actions;
 
@@ -1152,7 +1166,7 @@ impl<B> StreamRef<B> {
         let promised_id = actions.send.reserve_local()?;
 
         let child_key = {
-            let child_ptr = me.store.insert(
+            let child_ptr = self.opaque.store.insert(
                 promised_id,
                 Stream::new(
                     promised_id,
@@ -1167,7 +1181,7 @@ impl<B> StreamRef<B> {
         };
 
         let pushed = {
-            let ptr = me.store.resolve(self.opaque.key);
+            let ptr = self.opaque.store.resolve(self.opaque.key);
             let mut stream = ptr.lock();
 
             let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
@@ -1178,7 +1192,7 @@ impl<B> StreamRef<B> {
         };
 
         if let Err(err) = pushed {
-            let child_ptr = me.store.resolve(child_key);
+            let child_ptr = self.opaque.store.resolve(child_key);
             let child_stream = child_ptr.lock();
             child_stream.unlink();
             child_stream.remove();
@@ -1187,7 +1201,7 @@ impl<B> StreamRef<B> {
 
         me.refs += 1;
         let opaque =
-            OpaqueStreamRef::new(self.opaque.inner.clone(), &mut me.store.resolve(child_key));
+            OpaqueStreamRef::new(self.opaque.inner.clone(), self.opaque.store.clone(), &mut self.opaque.store.resolve(child_key));
 
         Ok(StreamRef {
             opaque,
@@ -1206,16 +1220,17 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
+
         me.actions.recv.take_request(&mut stream)
     }
 
     /// Called by a client to see if the current stream is pending open
     pub fn is_pending_open(&self) -> bool {
-        let me = self.opaque.inner.lock().unwrap();
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
+
         stream.is_pending_open
     }
 
@@ -1224,7 +1239,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
         me.actions
@@ -1237,7 +1252,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
         me.actions.send.capacity(&mut stream)
@@ -1248,7 +1263,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
         me.actions.send.poll_capacity(cx, &mut stream)
@@ -1263,7 +1278,7 @@ impl<B> StreamRef<B> {
         let mut me = self.opaque.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.opaque.key);
+        let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
         me.actions.send.poll_reset(cx, &mut stream, mode)
@@ -1290,11 +1305,12 @@ impl<B> Clone for StreamRef<B> {
 // ===== impl OpaqueStreamRef =====
 
 impl OpaqueStreamRef {
-    fn new(inner: Arc<Mutex<Inner>>, ptr: &mut store::Ptr) -> OpaqueStreamRef {
+    fn new(inner: Arc<Mutex<Inner>>, store: Arc<Store>, ptr: &mut store::Ptr) -> OpaqueStreamRef {
         let mut stream = ptr.lock();
         stream.ref_inc();
         OpaqueStreamRef {
             inner,
+            store,
             key: ptr.key(),
         }
     }
@@ -1303,7 +1319,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
 
         me.actions.recv.poll_response(cx, &mut stream)
@@ -1316,7 +1332,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
 
         me.actions
@@ -1325,7 +1341,7 @@ impl OpaqueStreamRef {
             .map_ok(|(h, key)| {
                 me.refs += 1;
                 let opaque_ref =
-                    OpaqueStreamRef::new(self.inner.clone(), &mut me.store.resolve(key));
+                    OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), &mut self.store.resolve(key));
                 (h, opaque_ref)
             })
     }
@@ -1334,7 +1350,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let stream = ptr.lock();
 
         me.actions.recv.is_end_stream(&stream)
@@ -1344,7 +1360,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
 
         me.actions.recv.poll_data(cx, &mut stream)
@@ -1354,27 +1370,23 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
 
         me.actions.recv.poll_trailers(cx, &mut stream)
     }
 
     pub(crate) fn available_recv_capacity(&self) -> isize {
-        let me = self.inner.lock().unwrap();
-        let me = &*me;
-
-        let ptr = &me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let stream = ptr.lock();
+
         stream.recv_flow.available().into()
     }
 
     pub(crate) fn used_recv_capacity(&self) -> WindowSize {
-        let me = self.inner.lock().unwrap();
-        let me = &*me;
-
-        let ptr = &me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let stream = ptr.lock();
+
         stream.in_flight_recv_data
     }
 
@@ -1384,7 +1396,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
 
         me.actions
@@ -1397,7 +1409,7 @@ impl OpaqueStreamRef {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let mut stream = ptr.lock();
         stream.is_recv = false;
         me.actions.recv.clear_recv_buffer(&mut stream);
@@ -1405,8 +1417,7 @@ impl OpaqueStreamRef {
 
     pub fn stream_id(&self) -> StreamId {
         // We probably can get StreamId easier if we just get it from the key
-        let me = self.inner.lock().unwrap();
-        let ptr = me.store.resolve(self.key);
+        let ptr = self.store.resolve(self.key);
         let stream = ptr.lock();
         stream.id
     }
@@ -1417,8 +1428,8 @@ impl fmt::Debug for OpaqueStreamRef {
         use std::sync::TryLockError::*;
 
         match self.inner.try_lock() {
-            Ok(me) => {
-                let ptr = &me.store.index(self.key);
+            Ok(_) => {
+                let ptr = &self.store.index(self.key);
                 let stream = ptr.lock().unwrap();
                 fmt.debug_struct("OpaqueStreamRef")
                     .field("stream_id", &stream.id)
@@ -1440,16 +1451,19 @@ impl fmt::Debug for OpaqueStreamRef {
 impl Clone for OpaqueStreamRef {
     fn clone(&self) -> Self {
         // Increment the ref count
-        let mut inner = self.inner.lock().unwrap();
         {
-            let ptr = inner.store.resolve(self.key);
+            let ptr = self.store.resolve(self.key);
             let mut stream = ptr.lock();
             stream.ref_inc();
         }
-        inner.refs += 1;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.refs += 1;
+        }
 
         OpaqueStreamRef {
             inner: self.inner.clone(),
+            store: self.store.clone(),
             key: self.key,
         }
     }
@@ -1457,12 +1471,12 @@ impl Clone for OpaqueStreamRef {
 
 impl Drop for OpaqueStreamRef {
     fn drop(&mut self) {
-        drop_stream_ref(&self.inner, self.key);
+        drop_stream_ref(&self.inner, &self.store, self.key);
     }
 }
 
 // TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
+fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, key: store::Key) {
     let mut me = match inner.lock() {
         Ok(inner) => inner,
         Err(_) => {
@@ -1477,7 +1491,7 @@ fn drop_stream_ref(inner: &Mutex<Inner>, key: store::Key) {
 
     let me = &mut *me;
     me.refs -= 1;
-    let ptr = me.store.resolve(key);
+    let ptr = store.resolve(key);
     let mut stream = ptr.lock();
 
     tracing::trace!("drop_stream_ref; stream={:?}", stream);
@@ -1649,7 +1663,7 @@ impl Actions {
         }
     }
 
-    fn clear_queues(&mut self, clear_pending_accept: bool, store: &mut Store, counts: &mut Counts) {
+    fn clear_queues(&mut self, clear_pending_accept: bool, store: &Store, counts: &mut Counts) {
         self.recv.clear_queues(clear_pending_accept, store, counts);
         self.send.clear_queues(store, counts);
     }

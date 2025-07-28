@@ -503,7 +503,7 @@ impl Recv {
     pub(crate) fn apply_local_settings(
         &mut self,
         settings: &frame::Settings,
-        store: &mut Store,
+        store: &Store,
     ) -> Result<(), proto::Error> {
         if let Some(val) = settings.is_extended_connect_protocol_enabled() {
             self.is_extended_connect_protocol_enabled = val;
@@ -949,7 +949,7 @@ impl Recv {
         Poll::Ready(Ok(()))
     }
 
-    pub fn clear_expired_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+    pub fn clear_expired_reset_streams(&mut self, store: &Store, counts: &mut Counts) {
         if !self.pending_reset_expired.is_empty() {
             let now = Instant::now();
             let reset_duration = self.reset_duration;
@@ -969,7 +969,7 @@ impl Recv {
     pub fn clear_queues(
         &mut self,
         clear_pending_accept: bool,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
     ) {
         self.clear_stream_window_update_queue(store, counts);
@@ -980,7 +980,7 @@ impl Recv {
         }
     }
 
-    fn clear_stream_window_update_queue(&mut self, store: &mut Store, counts: &mut Counts) {
+    fn clear_stream_window_update_queue(&mut self, store: &Store, counts: &mut Counts) {
         while let Some(ptr) = self.pending_window_updates.pop(store) {
             let stream = ptr.lock();
             counts.transition(stream, |_, stream| {
@@ -990,14 +990,14 @@ impl Recv {
     }
 
     /// Called on EOF
-    fn clear_all_reset_streams(&mut self, store: &mut Store, counts: &mut Counts) {
+    fn clear_all_reset_streams(&mut self, store: &Store, counts: &mut Counts) {
         while let Some(ptr) = self.pending_reset_expired.pop(store) {
             let stream = ptr.lock();
             counts.transition_after(stream, true);
         }
     }
 
-    fn clear_all_pending_accept(&mut self, store: &mut Store, counts: &mut Counts) {
+    fn clear_all_pending_accept(&mut self, store: &Store, counts: &mut Counts) {
         while let Some(ptr) = self.pending_accept.pop(store) {
             let stream = ptr.lock();
             counts.transition_after(stream, false);
@@ -1007,7 +1007,7 @@ impl Recv {
     pub fn poll_complete<T, B>(
         &mut self,
         cx: &mut Context,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -1057,7 +1057,7 @@ impl Recv {
     pub fn send_stream_window_updates<T, B>(
         &mut self,
         cx: &mut Context,
-        store: &mut Store,
+        store: &Store,
         counts: &mut Counts,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -1109,7 +1109,7 @@ impl Recv {
         }
     }
 
-    pub fn next_incoming(&mut self, store: &mut Store) -> Option<store::Key> {
+    pub fn next_incoming(&mut self, store: &Store) -> Option<store::Key> {
         self.pending_accept.pop(store).map(|ptr| ptr.key())
     }
 
