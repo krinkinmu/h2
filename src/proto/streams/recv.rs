@@ -293,8 +293,7 @@ impl Recv {
     ) -> Poll<Option<Result<(Request<()>, store::Key), proto::Error>>> {
         use super::peer::PollMessage::*;
 
-        let mut ppp = stream.pending_push_promises.take();
-        let pushed = ppp.pop(stream.store_mut()).map(|ptr| {
+        let pushed = stream.pending_push_promises.pop(stream.store_mut()).map(|ptr| {
             let mut pushed = ptr.lock();
             match pushed.pending_recv.pop_front(&mut self.buffer) {
                 Some(Event::Headers(Server(headers))) => (headers, pushed.key()),
@@ -303,7 +302,6 @@ impl Recv {
                 _ => panic!("Headers not set on pushed stream"),
             }
         });
-        stream.pending_push_promises = ppp;
         if let Some(p) = pushed {
             Poll::Ready(Some(Ok(p)))
         } else {

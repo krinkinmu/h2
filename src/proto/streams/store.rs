@@ -6,7 +6,6 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt;
 use std::marker::PhantomData;
-use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -47,7 +46,7 @@ struct SlabIndex(u32);
 
 #[derive(Debug)]
 pub(super) struct Queue<N> {
-    queue: VecDeque<StreamId>,
+    queue: Mutex<VecDeque<StreamId>>,
     _p: PhantomData<N>,
 }
 
@@ -261,14 +260,7 @@ where
 {
     pub fn new() -> Self {
         Queue {
-            queue: VecDeque::new(),
-            _p: PhantomData,
-        }
-    }
-
-    pub fn take(&mut self) -> Self {
-        Queue {
-            queue: mem::take(&mut self.queue),
+            queue: Mutex::new(VecDeque::new()),
             _p: PhantomData,
         }
     }
@@ -276,7 +268,7 @@ where
     /// Queue the stream.
     ///
     /// If the stream is already contained by the list, return `false`.
-    pub fn push(&mut self, stream: &mut store::PtrMut) -> bool {
+    pub fn push(&self, stream: &mut store::PtrMut) -> bool {
         tracing::trace!("Queue::push_back");
 
         if N::is_queued(stream) {
@@ -285,14 +277,14 @@ where
         }
 
         N::set_queued(stream, true);
-        self.queue.push_back(stream.id);
+        self.queue.lock().unwrap().push_back(stream.id);
         true
     }
 
     /// Queue the stream
     ///
     /// If the stream is already contained by the list, return `false`.
-    pub fn push_front(&mut self, stream: &mut store::PtrMut) -> bool {
+    pub fn push_front(&self, stream: &mut store::PtrMut) -> bool {
         tracing::trace!("Queue::push_front");
 
         if N::is_queued(stream) {
@@ -301,15 +293,16 @@ where
         }
 
         N::set_queued(stream, true);
-        self.queue.push_front(stream.id);
+        self.queue.lock().unwrap().push_front(stream.id);
         true
     }
 
-    pub fn pop<'a, R>(&mut self, resolve: &'a R) -> Option<store::Ptr<'a>>
+    pub fn pop<'a, R>(&self, resolve: &'a R) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
     {
-        if let Some(stream_id) = self.queue.pop_front() {
+        let ret = self.queue.lock().unwrap().pop_front();
+        if let Some(stream_id) = ret {
             let store = resolve.store();
             let ptr = store.find(&stream_id).unwrap();
             {
@@ -324,21 +317,25 @@ where
     }
 
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.lock().unwrap().is_empty()
     }
 
-    pub fn pop_if<'a, R, F>(&mut self, resolve: &'a R, f: F) -> Option<store::Ptr<'a>>
+    pub fn pop_if<'a, R, F>(&self, resolve: &'a R, f: F) -> Option<store::Ptr<'a>>
     where
         R: Resolve,
         F: Fn(&Stream) -> bool,
     {
-        if let Some(stream_id) = self.queue.front() {
+        // TODO: This method is only used in pending reset expiration queue.
+        // We could create a special implementation of that queue that would not
+        // need to take a lock on the stream while holding a queue lock.
+        let mut queue = self.queue.lock().unwrap();
+        if let Some(stream_id) = queue.front() {
             let store = resolve.store();
             let ptr = store.find(stream_id).unwrap();
             let mut stream = ptr.lock();
             let should_pop = f(&stream);
             if should_pop {
-                let _ = self.queue.pop_front();
+                let _ = queue.pop_front();
                 debug_assert!(N::is_queued(&stream));
                 N::set_queued(&mut stream, false);
                 drop(stream);

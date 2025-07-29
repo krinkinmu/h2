@@ -40,6 +40,11 @@ where
     /// Tracks send & recv stream concurrency.
     counts: Arc<Mutex<Counts>>,
 
+    send: Arc<Send>,
+
+    /// Task that calls `poll_complete`.
+    task: Arc<Mutex<Option<Waker>>>,
+
     _p: ::std::marker::PhantomData<P>,
 }
 
@@ -54,6 +59,10 @@ pub(crate) struct DynStreams<'a, B> {
     store: &'a Store,
 
     counts: &'a Mutex<Counts>,
+
+    send: &'a Send,
+
+    task: &'a Mutex<Option<Waker>>,
 
     peer: peer::Dyn,
 }
@@ -70,6 +79,8 @@ pub(crate) struct OpaqueStreamRef {
     inner: Arc<Mutex<Inner>>,
     store: Arc<Store>,
     counts: Arc<Mutex<Counts>>,
+    send: Arc<Send>,
+    task: Arc<Mutex<Option<Waker>>>,
     key: store::Key,
 }
 
@@ -90,12 +101,6 @@ struct Inner {
 struct Actions {
     /// Manages state transitions initiated by receiving frames
     recv: Recv,
-
-    /// Manages state transitions initiated by sending frames
-    send: Send,
-
-    /// Task that calls `poll_complete`.
-    task: Mutex<Option<Waker>>,
 
     /// If the connection errors, a copy is kept for any StreamRefs.
     conn_error: Option<proto::Error>,
@@ -122,6 +127,8 @@ where
             send_buffer: Arc::new(SendBuffer::new()),
             store: Arc::new(Store::new()),
             counts: Arc::new(Mutex::new(Counts::new(peer, config))),
+            send: Arc::new(Send::new(config)),
+            task: Arc::new(Mutex::new(None)),
             _p: ::std::marker::PhantomData,
         }
     }
@@ -132,7 +139,7 @@ where
 
         me.actions
             .recv
-            .set_target_connection_window(size, &me.actions.task)
+            .set_target_connection_window(size, &self.task)
     }
 
     pub fn next_incoming(&mut self) -> Option<StreamRef<B>> {
@@ -161,7 +168,7 @@ where
             }
 
             StreamRef {
-                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), &mut ptr),
+                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), self.send.clone(), self.task.clone(), &mut ptr),
                 send_buffer: self.send_buffer.clone(),
             }
         })
@@ -201,27 +208,24 @@ where
     {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.poll_complete(&self.send_buffer, &self.store, &mut counts, cx, dst)
+        me.poll_complete(&self.send_buffer, &self.store, &mut counts, &self.send, &self.task, cx, dst)
     }
 
     pub fn apply_remote_settings(
-        &mut self,
+        &self,
         frame: &frame::Settings,
         is_initial: bool,
     ) -> Result<(), Error> {
-        let mut me = self.inner.lock().unwrap();
-        let me = &mut *me;
-
         let mut counts = self.counts.lock().unwrap();
 
         counts.apply_remote_settings(frame, is_initial);
 
-        me.actions.send.apply_remote_settings(
+        self.send.apply_remote_settings(
             frame,
             &self.send_buffer.inner,
             &self.store,
             &mut counts,
-            &me.actions.task,
+            &self.task,
         )
     }
 
@@ -257,7 +261,7 @@ where
         let mut counts = self.counts.lock().unwrap();
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.check_next_stream_id()?;
+        self.send.check_next_stream_id()?;
 
         // The `pending` argument is provided by the `Client`, and holds
         // a store `Key` of a `Stream` that may have been not been opened
@@ -278,11 +282,11 @@ where
             return Err(UserError::UnexpectedFrameType.into());
         }
 
-        let stream_id = me.actions.send.open()?;
+        let stream_id = self.send.open()?;
 
         let mut stream = Stream::new(
             stream_id,
-            me.actions.send.init_window_sz(),
+            self.send.init_window_sz(),
             me.actions.recv.init_window_sz(),
         );
 
@@ -298,12 +302,12 @@ where
         {
             let mut stream = ptr.lock();
 
-            let sent = me.actions.send.send_headers(
+            let sent = self.send.send_headers(
                 headers,
                 &self.send_buffer.inner,
                 &mut stream,
                 &mut counts,
-                &me.actions.task,
+                &self.task,
             );
 
             // send_headers can return a UserError, if it does,
@@ -326,7 +330,7 @@ where
         let is_full = counts.next_send_stream_will_reach_capacity();
         Ok((
             StreamRef {
-                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), &mut ptr),
+                opaque: OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), self.send.clone(), self.task.clone(), &mut ptr),
                 send_buffer: self.send_buffer.clone(),
             },
             is_full,
@@ -334,12 +338,7 @@ where
     }
 
     pub(crate) fn is_extended_connect_protocol_enabled(&self) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .actions
-            .send
-            .is_extended_connect_protocol_enabled()
+        self.send.is_extended_connect_protocol_enabled()
     }
 
     pub fn current_max_send_streams(&self) -> usize {
@@ -365,32 +364,32 @@ impl<B> DynStreams<'_, B> {
     pub fn recv_headers(&mut self, frame: frame::Headers) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_headers(self.peer, self.send_buffer, self.store, &mut counts, frame)
+        me.recv_headers(self.peer, self.send_buffer, self.store, &mut counts, &self.send, &self.task, frame)
     }
 
     pub fn recv_data(&mut self, frame: frame::Data) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_data(self.peer, self.send_buffer, self.store, &mut counts, frame)
+        me.recv_data(self.peer, self.send_buffer, self.store, &mut counts, &self.send, &self.task, frame)
     }
 
     pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_reset(self.send_buffer, self.store, &mut counts, frame)
+        me.recv_reset(self.send_buffer, self.store, &mut counts, &self.send, frame)
     }
 
     /// Notify all streams that a connection-level error happened.
     pub fn handle_error(&mut self, err: proto::Error) -> StreamId {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.handle_error(self.send_buffer, self.store, &mut counts, err)
+        me.handle_error(self.send_buffer, self.store, &mut counts, &self.send, err)
     }
 
     pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_go_away(self.send_buffer, self.store, &mut counts, frame)
+        me.recv_go_away(self.send_buffer, self.store, &mut counts, &self.send, frame)
     }
 
     pub fn last_processed_id(&self) -> StreamId {
@@ -400,25 +399,25 @@ impl<B> DynStreams<'_, B> {
     pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_window_update(self.send_buffer, self.store, &mut counts, frame)
+        me.recv_window_update(self.send_buffer, self.store, &mut counts, &self.send, &self.task, frame)
     }
 
     pub fn recv_push_promise(&mut self, frame: frame::PushPromise) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.recv_push_promise(self.send_buffer, self.store, &mut counts, frame)
+        me.recv_push_promise(self.send_buffer, self.store, &mut counts, &self.send, &self.task, frame)
     }
 
     pub fn recv_eof(&mut self, clear_pending_accept: bool) -> Result<(), ()> {
         let mut me = self.inner.lock().map_err(|_| ())?;
         let mut counts = self.counts.lock().unwrap();
-        me.recv_eof(self.send_buffer, self.store, &mut counts, clear_pending_accept)
+        me.recv_eof(self.send_buffer, self.store, &mut counts, &self.send, clear_pending_accept)
     }
 
     pub fn send_reset(&mut self, id: StreamId, reason: Reason) {
         let mut me = self.inner.lock().unwrap();
         let mut counts = self.counts.lock().unwrap();
-        me.send_reset(self.send_buffer, self.store, &mut counts, id, reason)
+        me.send_reset(self.send_buffer, self.store, &mut counts, &self.send, &self.task, id, reason)
     }
 
     pub fn send_go_away(&mut self, last_processed_id: StreamId) {
@@ -432,8 +431,6 @@ impl Inner {
         Arc::new(Mutex::new(Inner {
             actions: Actions {
                 recv: Recv::new(peer, &config),
-                send: Send::new(&config),
-                task: Mutex::new(None),
                 conn_error: None,
             },
             refs: 1,
@@ -446,6 +443,8 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
         frame: frame::Headers,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -472,7 +471,7 @@ impl Inner {
                 if !peer.is_server() {
                     // This may be response headers for a stream we've already
                     // forgotten about...
-                    if self.actions.may_have_forgotten_stream(peer, id) {
+                    if self.actions.may_have_forgotten_stream(peer, id, send) {
                         tracing::debug!(
                             "recv_headers for old stream={:?}, sending STREAM_CLOSED",
                             id,
@@ -489,7 +488,7 @@ impl Inner {
                     Some(stream_id) => {
                         let stream = Stream::new(
                             stream_id,
-                            self.actions.send.init_window_sz(),
+                            send.init_window_sz(),
                             self.actions.recv.init_window_sz(),
                         );
 
@@ -526,15 +525,15 @@ impl Inner {
                     Ok(()) => Ok(()),
                     Err(RecvHeaderBlockError::Oversize(resp)) => {
                         if let Some(resp) = resp {
-                            let sent = actions.send.send_headers(
-                                resp, send_buffer, stream, counts, &actions.task);
+                            let sent = send.send_headers(
+                                resp, send_buffer, stream, counts, task);
                             debug_assert!(sent.is_ok(), "oversize response should not fail");
 
-                            actions.send.schedule_implicit_reset(
+                            send.schedule_implicit_reset(
                                 stream,
                                 Reason::PROTOCOL_ERROR,
                                 counts,
-                                &actions.task);
+                                task);
 
                             actions.recv.enqueue_reset_expiration(stream, counts);
 
@@ -556,7 +555,7 @@ impl Inner {
                 actions.recv.recv_trailers(frame, stream)
             };
 
-            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res)
+            actions.reset_on_recv_stream_err(send_buffer, stream, counts, res, send, task)
         })
     }
 
@@ -566,6 +565,8 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
         frame: frame::Data,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -584,7 +585,7 @@ impl Inner {
                     return Ok(());
                 }
 
-                if self.actions.may_have_forgotten_stream(peer, id) {
+                if self.actions.may_have_forgotten_stream(peer, id, send) {
                     tracing::debug!("recv_data for old stream={:?}, sending STREAM_CLOSED", id,);
 
                     let sz = frame.payload().len();
@@ -618,7 +619,7 @@ impl Inner {
                     .recv
                     .release_connection_capacity(sz as WindowSize, &Mutex::new(None));
             }
-            actions.reset_on_recv_stream_err(&send_buffer.inner, stream, counts, res)
+            actions.reset_on_recv_stream_err(&send_buffer.inner, stream, counts, res, send, task)
         })
     }
 
@@ -627,6 +628,7 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
         frame: frame::Reset,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -652,7 +654,7 @@ impl Inner {
             None => {
                 // TODO: Are there other error cases?
                 self.actions
-                    .ensure_not_idle(counts.peer(), id)
+                    .ensure_not_idle(counts.peer(), id, send)
                     .map_err(Error::library_go_away)?;
 
                 return Ok(());
@@ -664,7 +666,7 @@ impl Inner {
 
         counts.transition(stream, |counts, stream| {
             actions.recv.recv_reset(frame, stream, counts)?;
-            actions.send.handle_error(&send_buffer.inner, stream, counts);
+            send.handle_error(&send_buffer.inner, stream, counts);
             assert!(stream.state.is_closed());
             Ok(())
         })
@@ -675,13 +677,14 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
         frame: frame::WindowUpdate,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
 
         if id.is_zero() {
-            self.actions
-                .send
+                send
                 .recv_connection_window_update(frame, store, counts)
                 .map_err(Error::library_go_away)?;
         } else {
@@ -692,16 +695,16 @@ impl Inner {
                 // This result is ignored as there is nothing to do when there
                 // is an error. The stream is reset by the function on error and
                 // the error is informational.
-                let _ = self.actions.send.recv_stream_window_update(
+                let _ = send.recv_stream_window_update(
                     frame.size_increment(),
                     &send_buffer.inner,
                     &mut stream,
                     counts,
-                    &self.actions.task,
+                    task,
                 );
             } else {
                 self.actions
-                    .ensure_not_idle(counts.peer(), id)
+                    .ensure_not_idle(counts.peer(), id, send)
                     .map_err(Error::library_go_away)?;
             }
         }
@@ -709,7 +712,7 @@ impl Inner {
         Ok(())
     }
 
-    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, counts: &mut Counts, err: proto::Error) -> StreamId {
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, counts: &mut Counts, send: &Send, err: proto::Error) -> StreamId {
         let actions = &mut self.actions;
 
         let last_processed_id = actions.recv.last_processed_id();
@@ -718,7 +721,7 @@ impl Inner {
             let stream = ptr.lock();
             counts.transition(stream, |counts, stream| {
                 actions.recv.handle_error(&err, stream);
-                actions.send.handle_error(&send_buffer.inner, stream, counts);
+                send.handle_error(&send_buffer.inner, stream, counts);
             })
         });
 
@@ -732,13 +735,14 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
         frame: &frame::GoAway,
     ) -> Result<(), Error> {
         let actions = &mut self.actions;
 
         let last_stream_id = frame.last_stream_id();
 
-        actions.send.recv_go_away(last_stream_id)?;
+        send.recv_go_away(last_stream_id)?;
 
         let err = Error::remote_go_away(frame.debug_data().clone(), frame.reason());
 
@@ -747,7 +751,7 @@ impl Inner {
             if stream.id > last_stream_id {
                 counts.transition(stream, |counts, stream| {
                     actions.recv.handle_error(&err, stream);
-                    actions.send.handle_error(&send_buffer.inner, stream, counts);
+                    send.handle_error(&send_buffer.inner, stream, counts);
                 })
             }
         });
@@ -762,6 +766,8 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
         frame: frame::PushPromise,
     ) -> Result<(), Error> {
         let id = frame.stream_id();
@@ -825,7 +831,7 @@ impl Inner {
             let ptr = store.insert(promised_id, {
                 Stream::new(
                     promised_id,
-                    self.actions.send.init_window_sz(),
+                    send.init_window_sz(),
                     self.actions.recv.init_window_sz(),
                 )
             });
@@ -845,6 +851,8 @@ impl Inner {
                                 stream,
                                 counts,
                                 stream_valid,
+                                send,
+                                task,
                             )
                             .map(|()| None)
                     }
@@ -872,6 +880,7 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
         clear_pending_accept: bool,
     ) -> Result<(), ()> {
         let actions = &mut self.actions;
@@ -895,11 +904,11 @@ impl Inner {
 
                 // This handles resetting send state associated with the
                 // stream
-                actions.send.handle_error(&send_buffer.inner, stream, counts);
+                send.handle_error(&send_buffer.inner, stream, counts);
             })
         });
 
-        actions.clear_queues(clear_pending_accept, store, counts);
+        actions.clear_queues(clear_pending_accept, store, counts, send);
         Ok(())
     }
 
@@ -908,6 +917,8 @@ impl Inner {
         send_buffer: &SendBuffer<B>,
         store: &Store,
         counts: &mut Counts,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
         cx: &mut Context,
         dst: &mut Codec<T, Prioritized<B>>,
     ) -> Poll<io::Result<()>>
@@ -925,7 +936,7 @@ impl Inner {
             .poll_complete(cx, store, counts, dst))?;
 
         // Send any other pending frames
-        ready!(self.actions.send.poll_complete(
+        ready!(send.poll_complete(
             cx,
             &send_buffer.inner,
             store,
@@ -934,12 +945,12 @@ impl Inner {
         ))?;
 
         // Nothing else to do, track the task
-        let _ = self.actions.task.lock().unwrap().insert(cx.waker().clone());
+        let _ = task.lock().unwrap().insert(cx.waker().clone());
 
         Poll::Ready(Ok(()))
     }
 
-    fn send_reset<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, counts: &mut Counts, id: StreamId, reason: Reason) {
+    fn send_reset<B>(&mut self, send_buffer: &SendBuffer<B>, store: &Store, counts: &mut Counts, send: &Send, task: &Mutex<Option<Waker>>, id: StreamId, reason: Reason) {
         let key = match store.find_entry(id) {
             Entry::Occupied(e) => e.key(),
             Entry::Vacant(e) => {
@@ -958,7 +969,7 @@ impl Inner {
                 if counts.peer().is_local_init(id) {
                     // We normally would open this stream, so update our
                     // next-send-id record.
-                    self.actions.send.maybe_reset_next_stream_id(id);
+                    send.maybe_reset_next_stream_id(id);
                 } else {
                     // We normally would recv this stream, so update our
                     // next-recv-id record.
@@ -979,6 +990,8 @@ impl Inner {
             Initiator::Library,
             counts,
             &send_buffer.inner,
+            send,
+            task,
         );
     }
 }
@@ -996,7 +1009,7 @@ where
         let me = &mut *me;
 
         me.actions.ensure_no_conn_error()?;
-        me.actions.send.check_next_stream_id()?;
+        self.send.check_next_stream_id()?;
 
         if let Some(pending) = pending {
             let ptr = self.store.resolve(pending.key);
@@ -1021,6 +1034,8 @@ where
             send_buffer,
             store,
             counts,
+            send,
+            task,
             _p,
         } = self;
         DynStreams {
@@ -1028,6 +1043,8 @@ where
             send_buffer,
             store,
             counts,
+            send,
+            task,
             peer: P::r#dyn(),
         }
     }
@@ -1082,6 +1099,8 @@ where
             send_buffer: self.send_buffer.clone(),
             store: self.store.clone(),
             counts: self.counts.clone(),
+            send: self.send.clone(),
+            task: self.task.clone(),
             _p: ::std::marker::PhantomData,
         }
     }
@@ -1095,7 +1114,7 @@ where
         if let Ok(mut inner) = self.inner.lock() {
             inner.refs -= 1;
             if inner.refs == 1 {
-                if let Some(task) = inner.actions.task.lock().unwrap().take() {
+                if let Some(task) = self.task.lock().unwrap().take() {
                     task.wake();
                 }
             }
@@ -1110,12 +1129,8 @@ impl<B> StreamRef<B> {
     where
         B: Buf,
     {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
-        let actions = &mut me.actions;
 
         WrappedCounts::Unlocked(&self.opaque.counts).transition(stream, |counts, stream| {
             // Create the data frame
@@ -1123,30 +1138,26 @@ impl<B> StreamRef<B> {
             frame.set_end_stream(end_stream);
 
             // Send the data frame
-            actions
+            self.opaque
                 .send
-                .send_data(frame, &self.send_buffer.inner, stream, counts, &actions.task)
+                .send_data(frame, &self.send_buffer.inner, stream, counts, &self.opaque.task)
         })
     }
 
     pub fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), UserError> {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
         let mut counts = self.opaque.counts.lock().unwrap();
 
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
-        let actions = &mut me.actions;
 
         counts.transition(stream, |counts, stream| {
             // Create the trailers frame
             let frame = frame::Headers::trailers(stream.id, trailers);
 
             // Send the trailers frame
-            actions
+            self.opaque
                 .send
-                .send_trailers(frame, &self.send_buffer.inner, stream, counts, &actions.task)
+                .send_trailers(frame, &self.send_buffer.inner, stream, counts, &self.opaque.task)
         })
     }
 
@@ -1160,7 +1171,7 @@ impl<B> StreamRef<B> {
         let stream = ptr.lock();
 
         me.actions
-            .send_reset(stream, reason, Initiator::User, &mut counts, &self.send_buffer.inner);
+            .send_reset(stream, reason, Initiator::User, &mut counts, &self.send_buffer.inner, &self.opaque.send, &self.opaque.task);
     }
 
     pub fn send_response(
@@ -1170,26 +1181,23 @@ impl<B> StreamRef<B> {
     ) -> Result<(), UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
         response.extensions_mut().clear();
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
 
         let mut counts = self.opaque.counts.lock().unwrap();
 
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let stream = ptr.lock();
-        let actions = &mut me.actions;
 
         counts.transition(stream, |counts, stream| {
             let frame = server::Peer::convert_send_message(stream.id, response, end_of_stream);
 
-            actions
+            self.opaque
                 .send
-                .send_headers(frame, &self.send_buffer.inner, stream, counts, &actions.task)
+                .send_headers(frame, &self.send_buffer.inner, stream, counts, &self.opaque.task)
         })
     }
 
     pub fn send_push_promise(
-        &mut self,
+        &self,
         mut request: Request<()>,
     ) -> Result<StreamRef<B>, UserError> {
         // Clear before taking lock, incase extensions contain a StreamRef.
@@ -1198,14 +1206,15 @@ impl<B> StreamRef<B> {
         let me = &mut *me;
 
         let actions = &mut me.actions;
-        let promised_id = actions.send.reserve_local()?;
+
+        let promised_id = self.opaque.send.reserve_local()?;
 
         let child_key = {
             let child_ptr = self.opaque.store.insert(
                 promised_id,
                 Stream::new(
                     promised_id,
-                    actions.send.init_window_sz(),
+                    self.opaque.send.init_window_sz(),
                     actions.recv.init_window_sz(),
                 ),
             );
@@ -1221,9 +1230,9 @@ impl<B> StreamRef<B> {
 
             let frame = crate::server::Peer::convert_push_message(stream.id, promised_id, request)?;
 
-            actions
+            self.opaque
                 .send
-                .send_push_promise(frame, &self.send_buffer.inner, &mut stream, &actions.task)
+                .send_push_promise(frame, &self.send_buffer.inner, &mut stream, &self.opaque.task)
         };
 
         if let Err(err) = pushed {
@@ -1236,7 +1245,7 @@ impl<B> StreamRef<B> {
 
         me.refs += 1;
         let opaque =
-            OpaqueStreamRef::new(self.opaque.inner.clone(), self.opaque.store.clone(), self.opaque.counts.clone(), &mut self.opaque.store.resolve(child_key));
+            OpaqueStreamRef::new(self.opaque.inner.clone(), self.opaque.store.clone(), self.opaque.counts.clone(), self.opaque.send.clone(), self.opaque.task.clone(), &mut self.opaque.store.resolve(child_key));
 
         Ok(StreamRef {
             opaque,
@@ -1270,55 +1279,41 @@ impl<B> StreamRef<B> {
     }
 
     /// Request capacity to send data
-    pub fn reserve_capacity(&mut self, capacity: WindowSize) {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
-        let mut counts = self.opaque.counts.lock().unwrap();
-
+    pub fn reserve_capacity(&self, capacity: WindowSize) {
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
-        me.actions
+        self.opaque
             .send
-            .reserve_capacity(capacity, &mut stream, &mut WrappedCounts::Locked(&mut counts))
+            .reserve_capacity(capacity, &mut stream, &mut WrappedCounts::Unlocked(&self.opaque.counts))
     }
 
     /// Returns the stream's current send capacity.
     pub fn capacity(&self) -> WindowSize {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
-        me.actions.send.capacity(&mut stream)
+        self.opaque.send.capacity(&mut stream)
     }
 
     /// Request to be notified when the stream's capacity increases
-    pub fn poll_capacity(&mut self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
+    pub fn poll_capacity(&self, cx: &Context) -> Poll<Option<Result<WindowSize, UserError>>> {
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
-        me.actions.send.poll_capacity(cx, &mut stream)
+        self.opaque.send.poll_capacity(cx, &mut stream)
     }
 
     /// Request to be notified for if a `RST_STREAM` is received for this stream.
     pub(crate) fn poll_reset(
-        &mut self,
+        &self,
         cx: &Context,
         mode: proto::PollReset,
     ) -> Poll<Result<Reason, crate::Error>> {
-        let mut me = self.opaque.inner.lock().unwrap();
-        let me = &mut *me;
-
         let ptr = self.opaque.store.resolve(self.opaque.key);
         let mut stream = ptr.lock();
 
-        me.actions.send.poll_reset(cx, &mut stream, mode)
+        self.opaque.send.poll_reset(cx, &mut stream, mode)
     }
 
     pub fn clone_to_opaque(&self) -> OpaqueStreamRef {
@@ -1342,13 +1337,15 @@ impl<B> Clone for StreamRef<B> {
 // ===== impl OpaqueStreamRef =====
 
 impl OpaqueStreamRef {
-    fn new(inner: Arc<Mutex<Inner>>, store: Arc<Store>, counts: Arc<Mutex<Counts>>, ptr: &mut store::Ptr) -> OpaqueStreamRef {
+    fn new(inner: Arc<Mutex<Inner>>, store: Arc<Store>, counts: Arc<Mutex<Counts>>, send: Arc<Send>, task: Arc<Mutex<Option<Waker>>>, ptr: &mut store::Ptr) -> OpaqueStreamRef {
         let mut stream = ptr.lock();
         stream.ref_inc();
         OpaqueStreamRef {
             inner,
             store,
             counts,
+            send,
+            task,
             key: ptr.key(),
         }
     }
@@ -1379,7 +1376,7 @@ impl OpaqueStreamRef {
             .map_ok(|(h, key)| {
                 me.refs += 1;
                 let opaque_ref =
-                    OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), &mut self.store.resolve(key));
+                    OpaqueStreamRef::new(self.inner.clone(), self.store.clone(), self.counts.clone(), self.send.clone(), self.task.clone(), &mut self.store.resolve(key));
                 (h, opaque_ref)
             })
     }
@@ -1439,7 +1436,7 @@ impl OpaqueStreamRef {
 
         me.actions
             .recv
-            .release_capacity(capacity, &mut stream, &me.actions.task)
+            .release_capacity(capacity, &mut stream, &self.task)
     }
 
     /// Clear the receive queue and set the status to no longer receive data frames.
@@ -1504,6 +1501,8 @@ impl Clone for OpaqueStreamRef {
             inner: self.inner.clone(),
             store: self.store.clone(),
             counts: self.counts.clone(),
+            send: self.send.clone(),
+            task: self.task.clone(),
             key: self.key,
         }
     }
@@ -1511,12 +1510,12 @@ impl Clone for OpaqueStreamRef {
 
 impl Drop for OpaqueStreamRef {
     fn drop(&mut self) {
-        drop_stream_ref(&self.inner, &self.store, &self.counts, self.key);
+        drop_stream_ref(&self.inner, &self.store, &self.counts, &self.send, &self.task, self.key);
     }
 }
 
 // TODO: Move back in fn above
-fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &Mutex<Counts>, key: store::Key) {
+fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &Mutex<Counts>, send: &Send, task: &Mutex<Option<Waker>>, key: store::Key) {
     let mut me = match inner.lock() {
         Ok(inner) => inner,
         Err(_) => {
@@ -1547,34 +1546,33 @@ fn drop_stream_ref(inner: &Mutex<Inner>, store: &Store, counts: &Mutex<Counts>, 
     // of canceling the stream), we should notify the task
     // (connection) so that it can close properly
     if stream.ref_count == 0 && stream.is_closed() {
-        if let Some(task) = actions.task.lock().unwrap().take() {
+        if let Some(task) = task.lock().unwrap().take() {
             task.wake();
         }
     }
 
     counts.transition(stream, |counts, stream| {
-        maybe_cancel(stream, actions, counts);
+        maybe_cancel(stream, actions, counts, send, task);
 
         if stream.ref_count == 0 {
             // Release any recv window back to connection, no one can access
             // it anymore.
             actions
                 .recv
-                .release_closed_capacity(stream, &actions.task);
+                .release_closed_capacity(stream, task);
 
             // We won't be able to reach our push promises anymore
-            let mut ppp = stream.pending_push_promises.take();
-            while let Some(promise) = ppp.pop(stream.store_mut()) {
+            while let Some(promise) = stream.pending_push_promises.pop(stream.store_mut()) {
                 let promise = promise.lock();
                 counts.transition(promise, |counts, stream| {
-                    maybe_cancel(stream, actions, counts);
+                    maybe_cancel(stream, actions, counts, send, task);
                 });
             }
         }
     });
 }
 
-fn maybe_cancel(stream: &mut store::PtrMut, actions: &mut Actions, counts: &mut Counts) {
+fn maybe_cancel(stream: &mut store::PtrMut, actions: &mut Actions, counts: &mut Counts, send: &Send, task: &Mutex<Option<Waker>>) {
     if stream.is_canceled_interest() {
         // Server is allowed to early respond without fully consuming the client input stream
         // But per the RFC, must send a RST_STREAM(NO_ERROR) in such cases. https://www.rfc-editor.org/rfc/rfc7540#section-8.1
@@ -1588,9 +1586,7 @@ fn maybe_cancel(stream: &mut store::PtrMut, actions: &mut Actions, counts: &mut 
             Reason::CANCEL
         };
 
-        actions
-            .send
-            .schedule_implicit_reset(stream, reason, counts, &actions.task);
+        send.schedule_implicit_reset(stream, reason, counts, task);
         actions.recv.enqueue_reset_expiration(stream, counts);
     }
 }
@@ -1617,15 +1613,17 @@ impl Actions {
         initiator: Initiator,
         counts: &mut Counts,
         send_buffer: &Buffer<Frame<B>>,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
     ) {
         counts.transition(stream, |counts, stream| {
-            self.send.send_reset(
+            send.send_reset(
                 reason,
                 initiator,
                 send_buffer,
                 stream,
                 counts,
-                &self.task,
+                task,
             );
             self.recv.enqueue_reset_expiration(stream, counts);
             // if a RecvStream is parked, ensure it's notified
@@ -1639,6 +1637,8 @@ impl Actions {
         stream: &mut store::PtrMut,
         counts: &mut Counts,
         res: Result<(), Error>,
+        send: &Send,
+        task: &Mutex<Option<Waker>>,
     ) -> Result<(), Error> {
         if let Err(Error::Reset(stream_id, reason, initiator)) = res {
             debug_assert_eq!(stream_id, stream.id);
@@ -1647,8 +1647,7 @@ impl Actions {
                 counts.inc_num_local_error_resets();
 
                 // Reset the stream.
-                self.send
-                    .send_reset(reason, initiator, buffer, stream, counts, &self.task);
+                send.send_reset(reason, initiator, buffer, stream, counts, task);
                 self.recv.enqueue_reset_expiration(stream, counts);
                 // if a RecvStream is parked, ensure it's notified
                 stream.notify_recv();
@@ -1668,9 +1667,9 @@ impl Actions {
         }
     }
 
-    fn ensure_not_idle(&mut self, peer: peer::Dyn, id: StreamId) -> Result<(), Reason> {
+    fn ensure_not_idle(&mut self, peer: peer::Dyn, id: StreamId, send: &Send) -> Result<(), Reason> {
         if peer.is_local_init(id) {
-            self.send.ensure_not_idle(id)
+            send.ensure_not_idle(id)
         } else {
             self.recv.ensure_not_idle(id)
         }
@@ -1693,19 +1692,19 @@ impl Actions {
     /// is more likely to be latency/memory constraints that caused this,
     /// and not a bad actor. So be less catastrophic, the spec allows
     /// us to send another RST_STREAM of STREAM_CLOSED.
-    fn may_have_forgotten_stream(&self, peer: peer::Dyn, id: StreamId) -> bool {
+    fn may_have_forgotten_stream(&self, peer: peer::Dyn, id: StreamId, send: &Send) -> bool {
         if id.is_zero() {
             return false;
         }
         if peer.is_local_init(id) {
-            self.send.may_have_created_stream(id)
+            send.may_have_created_stream(id)
         } else {
             self.recv.may_have_created_stream(id)
         }
     }
 
-    fn clear_queues(&mut self, clear_pending_accept: bool, store: &Store, counts: &mut Counts) {
+    fn clear_queues(&mut self, clear_pending_accept: bool, store: &Store, counts: &mut Counts, send: &Send) {
         self.recv.clear_queues(clear_pending_accept, store, counts);
-        self.send.clear_queues(store, counts);
+        send.clear_queues(store, counts);
     }
 }
